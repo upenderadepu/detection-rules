@@ -6,7 +6,7 @@
 """ECS Schemas management."""
 import os
 import re
-from typing import List
+from typing import List, Optional
 
 import kql
 import eql
@@ -64,16 +64,35 @@ def _decompress_and_save_schema(url, release_name):
         f.write(compressed)
 
 
+def download_beats_schema(version: str):
+    """Download a beats schema by version."""
+    url = 'https://api.github.com/repos/elastic/beats/releases'
+    releases = requests.get(url)
+
+    version = f'v{version.lstrip("v")}'
+    beats_release = None
+    for release in releases.json():
+        if release['tag_name'] == version:
+            beats_release = release
+            break
+
+    if not beats_release:
+        print(f'beats release {version} not found!')
+        return
+
+    beats_url = beats_release['zipball_url']
+    name = beats_release['tag_name']
+
+    _decompress_and_save_schema(beats_url, name)
+
+
 def download_latest_beats_schema():
     """Download additional schemas from beats releases."""
     url = 'https://api.github.com/repos/elastic/beats/releases'
     releases = requests.get(url)
 
     latest_release = max(releases.json(), key=lambda release: Version(release["tag_name"].lstrip("v")))
-    beats_url = latest_release['zipball_url']
-    name = latest_release['tag_name']
-
-    _decompress_and_save_schema(beats_url, name)
+    download_beats_schema(latest_release["tag_name"])
 
 
 def refresh_master_schema():
@@ -154,6 +173,9 @@ def get_beats_sub_schema(schema: dict, beat: str, module: str, *datasets: str):
 
         dataset_dir = module_dir.get("folders", {}).get(dataset, {})
         flattened.extend(get_field_schema(dataset_dir, prefix=module + ".", include_common=True))
+
+    # we also need to capture (beta?) fields which are directly within the module _meta.files.fields
+    flattened.extend(get_field_schema(module_dir, include_common=True))
 
     return {field["name"]: field for field in sorted(flattened, key=lambda f: f["name"])}
 
@@ -244,3 +266,9 @@ def get_schema_from_kql(tree: kql.ast.BaseNode, beats: list, version: str = None
             datasets.update(child.value for child in node.value if isinstance(child, kql.ast.String))
 
     return get_schema_from_datasets(beats, modules, datasets, version=version)
+
+
+def parse_beats_from_index(index: Optional[list]) -> List[str]:
+    indexes = index or []
+    beat_types = [index.split("-")[0] for index in indexes if "beat-*" in index]
+    return beat_types
