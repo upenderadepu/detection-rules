@@ -1,0 +1,12 @@
+name: docs-preview-cleanup
+on:
+  pull_request_target:
+    branches: [main]
+    types: [closed]
+permissions:
+  contents: none
+  deployments: write
+  id-token: write
+jobs:
+  cleanup:
+    uses: elastic/docs-actions/.github/workflows/docs-preview-cleanup.yml@6b05361e59d92a62011b79f85e06562c779c86e6 # v1

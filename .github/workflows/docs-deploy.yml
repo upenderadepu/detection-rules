@@ -1,0 +1,14 @@
+name: docs-deploy
+on:
+  workflow_run:
+    workflows: [docs-build]
+    types: [completed]
+permissions:
+  contents: read
+  deployments: write
+  id-token: write
+  pull-requests: write
+  actions: read
+jobs:
+  deploy:
+    uses: elastic/docs-actions/.github/workflows/docs-deploy.yml@6b05361e59d92a62011b79f85e06562c779c86e6 # v1

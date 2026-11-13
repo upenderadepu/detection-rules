@@ -4,207 +4,857 @@
 # 2.0.
 
 """CLI commands for internal detection_rules dev team."""
+
+import csv
 import dataclasses
-import hashlib
-import io
 import json
 import os
+import re
 import shutil
 import subprocess
+import textwrap
 import time
+import typing
+import urllib.parse
+from collections import defaultdict
 from pathlib import Path
+from typing import Any, Literal
+from uuid import uuid4
 
 import click
+import pytoml  # type: ignore[reportMissingTypeStubs]
+import requests.exceptions
+import yaml
 from elasticsearch import Elasticsearch
-from eql import load_dump
-from kibana.connector import Kibana
+from eql.table import Table  # type: ignore[reportMissingTypeStubs]
+from eql.utils import load_dump  # type: ignore[reportMissingTypeStubs, reportUnknownVariableType]
+from kibana.connector import Kibana  # type: ignore[reportMissingTypeStubs]
+from kibana.resources import Signal  # type: ignore[reportMissingTypeStubs]
+from semver import Version
 
-from . import rule_loader
+from . import atlas, attack, rule_loader, utils
+from .beats import download_beats_schema, download_latest_beats_schema, refresh_main_schema
+from .cli_utils import multi_collection, single_collection
+from .config import (
+    DEFAULT_THREAT_MAPPING_FRAMEWORK,
+    DEFAULT_THREAT_MAPPING_VERSION,
+    parse_rules_config,
+)
+from .docs import REPO_DOCS_DIR, IntegrationSecurityDocs, IntegrationSecurityDocsMDX
+from .ecs import download_endpoint_schemas, download_schemas
+from .endgame import EndgameSchemaManager
 from .eswrap import CollectEvents, add_range_to_dsl
+from .ghwrap import GithubClient, update_gist
+from .integrations import (
+    SecurityDetectionEngine,
+    build_integrations_manifest,
+    build_integrations_schemas,
+    find_latest_compatible_version,
+    find_latest_integration_version,
+    load_integrations_manifests,
+)
 from .main import root
-from .misc import PYTHON_LICENSE, add_client, GithubClient, Manifest, client_error, getdefault
-from .packaging import PACKAGE_FILE, Package, manage_versions, RELEASE_DIR
-from .rule import TOMLRule, TOMLRuleContents, BaseQueryRuleData
-from .rule_loader import get_rule
-from .utils import get_path, dict_hash
+from .misc import (
+    PYTHON_LICENSE,
+    add_client,
+    raise_client_error,
+)
+from .navigator import select_navigator_gist_files
+from .packaging import CURRENT_RELEASE_PATH, PACKAGE_FILE, RELEASE_DIR, Package
+from .rule import (
+    AnyRuleData,
+    BaseRuleData,
+    DeprecatedRule,
+    QueryRuleData,
+    RuleTransform,
+    ThreatMapping,
+    TOMLRule,
+    TOMLRuleContents,
+    VersionedThreatMapping,
+)
+from .rule_loader import RuleCollection, production_filter
+from .schemas import definitions, get_stack_versions
+from .utils import check_version_lock_double_bumps, dict_hash, get_etc_path, get_path
+from .version_lock import VersionLockFile, loaded_version_lock
 
-RULES_DIR = get_path('rules')
+GH_CONFIG = Path.home() / ".config" / "gh" / "hosts.yml"
+NAVIGATOR_GIST_ID = "0443cfb5016bed103f1940b2f336e45a"
+NAVIGATOR_URL = "https://ela.st/detection-rules-navigator-trade"
+NAVIGATOR_BADGE = (
+    f"[![ATT&CK navigator coverage](https://img.shields.io/badge/ATT&CK-Navigator-red.svg)]({NAVIGATOR_URL})"
+)
+RULES_CONFIG = parse_rules_config()
+
+# The rule diff feature is available in 8.18 but needs to be tested in pre-release versions
+MIN_DIFF_FEATURE_VERSION = Version(major=8, minor=17, patch=0)
+
+# The caps for the historical versions of the rules
+MAX_HISTORICAL_VERSIONS_FOR_DIFF = 3
+MAX_HISTORICAL_VERSIONS_PRE_DIFF = 1
 
 
-@root.group('dev')
-def dev_group():
+def get_github_token() -> str | None:
+    """Get the current user's GitHub token."""
+    token = os.getenv("GITHUB_TOKEN")
+
+    if token is None and GH_CONFIG.exists():
+        token = load_dump(str(GH_CONFIG)).get("github.com", {}).get("oauth_token")
+
+    return token
+
+
+@root.group("dev")
+def dev_group() -> None:
     """Commands related to the Elastic Stack rules release lifecycle."""
 
 
-@dev_group.command('build-release')
-@click.argument('config-file', type=click.Path(exists=True, dir_okay=False), required=False, default=PACKAGE_FILE)
-@click.option('--update-version-lock', '-u', is_flag=True,
-              help='Save version.lock.json file with updated rule versions in the package')
-def build_release(config_file, update_version_lock, release=None, verbose=True):
+@dev_group.command("build-release")
+@click.argument(
+    "config-file", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=False, default=PACKAGE_FILE
+)
+@click.option(
+    "--update-version-lock",
+    "-u",
+    is_flag=True,
+    help="Save version.lock.json file with updated rule versions in the package",
+)
+@click.option("--generate-navigator", is_flag=True, help="Generate ATT&CK navigator files")
+@click.option("--generate-docs", is_flag=True, default=False, help="Generate markdown documentation")
+@click.option("--update-message", type=str, help="Update message for new package")
+@click.pass_context
+def build_release(  # noqa: PLR0913, PLR0917
+    ctx: click.Context,
+    config_file: Path,
+    update_version_lock: bool,
+    generate_navigator: bool,
+    generate_docs: str,
+    update_message: str,
+    release: str | None = None,
+    verbose: bool = True,
+) -> Package:
     """Assemble all the rules into Kibana-ready release files."""
-    config = load_dump(config_file)['package']
+    if RULES_CONFIG.bypass_version_lock:
+        click.echo(
+            "WARNING: You cannot run this command when the versioning strategy is configured to bypass the "
+            "version lock. Set `bypass_version_lock` to `False` in the rules config to use the version lock."
+        )
+        ctx.exit()
+
+    config = load_dump(str(config_file))["package"]
+
+    package_path = get_etc_path(["package.yaml"])
+    if "registry_data" not in config:
+        raise ValueError(
+            f"No `registry_data` in package config. Please see the {package_path} file for an"
+            f" example on how to supply this field in {PACKAGE_FILE}."
+        )
+
+    registry_data = config["registry_data"]
+
+    if generate_navigator:
+        config["generate_navigator"] = True
+
     if release is not None:
-        config['release'] = release
+        config["release"] = release
 
     if verbose:
-        click.echo('[+] Building package {}'.format(config.get('name')))
+        click.echo(f"[+] Building package {config.get('name')}")
 
-    package = Package.from_config(config, update_version_lock=update_version_lock, verbose=verbose)
+    package = Package.from_config(config=config, verbose=verbose)
+
+    if update_version_lock:
+        _ = loaded_version_lock.manage_versions(package.rules, save_changes=True, verbose=verbose)
+
     package.save(verbose=verbose)
 
+    previous_pkg_version = find_latest_integration_version(
+        "security_detection_engine", "ga", registry_data["conditions"]["kibana.version"].strip("^")
+    )
+    sde = SecurityDetectionEngine()
+    historical_rules = sde.load_integration_assets(previous_pkg_version)
+    current_pkg_version = Version.parse(registry_data["version"])
+    # pre-release versions are not included in the version comparison
+    # Version 8.17.0-beta.1 is considered lower than 8.17.0
+    current_pkg_version_no_prerelease = Version(
+        major=current_pkg_version.major, minor=current_pkg_version.minor, patch=current_pkg_version.patch
+    )
+
+    hist_versions_num = (
+        MAX_HISTORICAL_VERSIONS_FOR_DIFF
+        if current_pkg_version_no_prerelease >= MIN_DIFF_FEATURE_VERSION
+        else MAX_HISTORICAL_VERSIONS_PRE_DIFF
+    )
+    click.echo(
+        "[+] Limit historical rule versions in the release package for "
+        f"version {current_pkg_version_no_prerelease}: {hist_versions_num} versions"
+    )
+    limited_historical_rules = sde.keep_latest_versions(historical_rules, num_versions=hist_versions_num)
+
+    _ = package.add_historical_rules(limited_historical_rules, registry_data["version"])
+    click.echo(f"[+] Adding historical rules from {previous_pkg_version} package")
+
+    # NOTE: stopgap solution until security doc migration
+    if generate_docs:
+        click.echo(f"[+] Generating security docs for {registry_data['version']} package")
+        docs = IntegrationSecurityDocsMDX(
+            registry_data["version"],
+            Path(f"releases/{config['name']}-docs"),
+            True,
+            package,
+            limited_historical_rules,
+            note=update_message,
+        )
+        _ = docs.generate()
+
     if verbose:
-        package.get_package_hash(verbose=True)
-        click.echo(f'- {len(package.rules)} rules included')
+        _ = package.get_package_hash(verbose=verbose)
+        click.echo(f"- {len(package.rules)} rules included")
 
     return package
 
 
-@dev_group.command('update-lock-versions')
-@click.argument('rule-ids', nargs=-1, required=True)
-def update_lock_versions(rule_ids):
-    """Update rule hashes in version.lock.json file without bumping version."""
-    from .packaging import manage_versions
+def get_release_diff(
+    pre: str,
+    post: str,
+    remote: str = "origin",
+) -> tuple[dict[str, TOMLRule], dict[str, TOMLRule], dict[str, DeprecatedRule]]:
+    """Build documents from two git tags for an integration package."""
+    pre_rules = RuleCollection()
+    pre_rules.load_git_tag(f"integration-v{pre}", remote, skip_query_validation=True)
 
-    if not click.confirm('Are you sure you want to update hashes without a version bump?'):
+    if pre_rules.errors:
+        click.echo(f"error loading {len(pre_rules.errors)} rule(s) from: {pre}, skipping:")
+        click.echo(" - " + "\n - ".join([str(p) for p in pre_rules.errors]))
+
+    post_rules = RuleCollection()
+    post_rules.load_git_tag(f"integration-v{post}", remote, skip_query_validation=True)
+
+    if post_rules.errors:
+        click.echo(f"error loading {len(post_rules.errors)} rule(s) from: {post}, skipping:")
+        click.echo(" - " + "\n - ".join([str(p) for p in post_rules.errors]))
+
+    return pre_rules.compare_collections(post_rules)
+
+
+@dev_group.command("build-integration-docs")
+@click.argument("registry-version")
+@click.option("--pre", required=True, type=str, help="Tag for pre-existing rules")
+@click.option("--post", required=True, type=str, help="Tag for rules post updates")
+@click.option("--directory", "-d", type=Path, required=True, help="Output directory to save docs to")
+@click.option("--force", "-f", is_flag=True, help="Bypass the confirmation prompt")
+@click.option("--remote", "-r", default="origin", help='Override the remote from "origin"')
+@click.option("--update-message", default="Rule Updates.", type=str, help="Update message for new package")
+@click.pass_context
+def build_integration_docs(  # noqa: PLR0913, PLR0917
+    ctx: click.Context,
+    registry_version: str,
+    pre: str,
+    post: str,
+    directory: Path,
+    force: bool,
+    update_message: str,
+    remote: str = "origin",
+) -> IntegrationSecurityDocs:
+    """Build documents from two git tags for an integration package."""
+    if not force and not click.confirm(
+        f"This will refresh tags and may overwrite local tags for: {pre} and {post}. Continue?"
+    ):
+        ctx.exit(1)
+
+    if Version.parse(pre) >= Version.parse(post):
+        raise ValueError(f"pre: {pre} is not less than post: {post}")
+
+    if not Version.parse(pre):
+        raise ValueError(f"pre: {pre} is not a valid semver")
+
+    if not Version.parse(post):
+        raise ValueError(f"post: {post} is not a valid semver")
+
+    rules_changes = get_release_diff(pre, post, remote)
+    docs = IntegrationSecurityDocs(
+        registry_version,
+        directory,
+        True,
+        *rules_changes,
+        update_message=update_message,
+    )
+    package_dir = docs.generate()
+
+    click.echo(f"Generated documents saved to: {package_dir}")
+    updated, new, deprecated = rules_changes
+    click.echo(f"- {len(updated)} updated rules")
+    click.echo(f"- {len(new)} new rules")
+    click.echo(f"- {len(deprecated)} deprecated rules")
+
+    return docs
+
+
+@dev_group.command("bump-pkg-versions")
+@click.option("--major-release", is_flag=True, help="bump the major version")
+@click.option("--minor-release", is_flag=True, help="bump the minor version")
+@click.option("--patch-release", is_flag=True, help="bump the patch version")
+@click.option("--new-package", type=click.Choice(["true", "false"]), help="indicates new package")
+@click.option(
+    "--maturity",
+    type=click.Choice(["beta", "ga"], case_sensitive=False),
+    required=True,
+    help="beta or production versions",
+)
+def bump_versions(
+    major_release: bool,
+    minor_release: bool,
+    patch_release: bool,
+    new_package: str,
+    maturity: str,
+) -> None:
+    """Bump the versions"""
+
+    pkg_data = RULES_CONFIG.packages["package"]
+    kibana_ver = Version.parse(pkg_data["name"], optional_minor_and_patch=True)
+    pkg_ver = Version.parse(pkg_data["registry_data"]["version"])
+    pkg_kibana_ver = Version.parse(pkg_data["registry_data"]["conditions"]["kibana.version"].lstrip("^"))
+    if major_release:
+        major_bump = kibana_ver.bump_major()
+        pkg_data["name"] = f"{major_bump.major}.{major_bump.minor}"
+        pkg_data["registry_data"]["conditions"]["kibana.version"] = f"^{pkg_kibana_ver.bump_major()}"
+        pkg_data["registry_data"]["version"] = str(pkg_ver.bump_major().bump_prerelease("beta"))
+    if minor_release:
+        minor_bump = kibana_ver.bump_minor()
+        pkg_data["name"] = f"{minor_bump.major}.{minor_bump.minor}"
+        pkg_data["registry_data"]["conditions"]["kibana.version"] = f"^{pkg_kibana_ver.bump_minor()}"
+        pkg_data["registry_data"]["version"] = str(pkg_ver.bump_minor().bump_prerelease("beta"))
+    if patch_release:
+        latest_patch_release_ver = find_latest_integration_version(
+            "security_detection_engine", maturity, pkg_kibana_ver
+        )
+
+        # if an existing minor or major does not have a package, bump from the last
+        # example is 8.10.0-beta.1 is last, but on 9.0.0 major
+        # example is 8.10.0-beta.1 is last, but on 8.11.0 minor
+        if latest_patch_release_ver.minor != pkg_kibana_ver.minor:
+            latest_patch_release_ver = latest_patch_release_ver.bump_minor()
+        if latest_patch_release_ver.major != pkg_kibana_ver.major:
+            latest_patch_release_ver = latest_patch_release_ver.bump_major()
+
+        if maturity == "ga":
+            pkg_data["registry_data"]["version"] = str(latest_patch_release_ver.bump_patch())
+        else:
+            # passing in true or false from GH actions; not using eval() for security purposes
+            if new_package == "true":
+                latest_patch_release_ver = latest_patch_release_ver.bump_patch()
+            pkg_data["registry_data"]["version"] = str(latest_patch_release_ver.bump_prerelease("beta"))
+
+        if "release" in pkg_data["registry_data"]:
+            pkg_data["registry_data"]["release"] = maturity
+
+    click.echo(f"Kibana version: {pkg_data['name']}")
+    click.echo(f"Package Kibana version: {pkg_data['registry_data']['conditions']['kibana.version']}")
+    click.echo(f"Package version: {pkg_data['registry_data']['version']}")
+
+    RULES_CONFIG.packages_file.write_text(yaml.safe_dump({"package": pkg_data}))
+
+
+@dev_group.command("check-version-lock")
+@click.option("--pr-number", type=int, help="Pull request number to fetch the version lock file from")
+@click.option(
+    "--local-file",
+    type=str,
+    default="detection_rules/etc/version.lock.json",
+    help="Path to the local version lock file (default: detection_rules/etc/version.lock.json)",
+)
+@click.option(
+    "--token",
+    required=True,
+    prompt=get_github_token() is None,
+    default=get_github_token(),
+    help="GitHub token to use for the PR",
+    hide_input=True,
+)
+@click.option("--comment", is_flag=True, help="If set, enables commenting on the PR (requires --pr-number)")
+@click.option("--save-double-bumps", type=Path, help="Optional path to save the double bumps to a file")
+@click.pass_context
+def check_version_lock(  # noqa: PLR0913, PLR0915, PLR0917
+    ctx: click.Context,
+    pr_number: int,
+    local_file: str,
+    token: str,
+    comment: bool,
+    save_double_bumps: Path,
+) -> None:
+    """
+    Check the version lock file and optionally comment on the PR if the --comment flag is set.
+
+    Note: Both --comment and --pr-number must be supplied for commenting to work.
+    """
+    if comment and not pr_number:
+        raise click.UsageError("--comment requires --pr-number to be supplied.")
+
+    github = GithubClient(token)
+    github.assert_github()
+    client = github.authenticated_client
+    repo = client.get_repo("elastic/detection-rules")
+    double_bumps = []
+    conflicts = []
+    comment_body = "No double bumps or version conflicts detected."
+
+    def format_comment_body(
+        double_bumps: list[tuple[str, str, int, int]], conflicts: list[tuple[str, str, str, int]]
+    ) -> str:
+        """Format the comment body for double bumps and version conflicts."""
+        comment_body = f"{len(double_bumps)} Double bumps detected:\n\n"
+        comment_body += "<details>\n"
+        comment_body += "<summary>Click to expand the list of double bumps</summary>\n\n"
+        for rule_id, rule_name, removed, added in double_bumps:
+            comment_body += f"- **Rule ID**: {rule_id}\n"
+            comment_body += f"  - **Rule Name**: {rule_name}\n"
+            comment_body += f"  - **Removed**: {removed}\n"
+            comment_body += f"  - **Added**: {added}\n"
+        comment_body += "\n</details>\n"
+        comment_body += f"\n{len(conflicts)} Version conflicts detected (same version, different content):\n\n"
+        comment_body += "<details>\n"
+        comment_body += "<summary>Click to expand the list of version conflicts</summary>\n\n"
+        for rule_id, rule_name, location, version in conflicts:
+            comment_body += f"- **Rule ID**: {rule_id}\n"
+            comment_body += f"  - **Rule Name**: {rule_name}\n"
+            comment_body += f"  - **Location**: {location}\n"
+            comment_body += f"  - **Version**: {version}\n"
+        comment_body += "\n</details>\n"
+        return comment_body
+
+    def save_double_bumps_to_file(double_bumps: list[tuple[str, str, int, int]], save_path: Path) -> None:
+        """Save double bumps to a CSV file."""
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        if save_path.is_file():
+            click.echo(f"File {save_path} already exists. Skipping save.")
+        else:
+            with save_path.open("w", newline="") as csvfile:
+                csv.writer(csvfile).writerows([["Rule ID", "Rule Name", "Removed", "Added"], *double_bumps])
+            click.echo(f"Double bumps saved to {save_path}")
+
+    pr = None
+
+    if pr_number:
+        click.echo(f"Fetching version lock file from PR #{pr_number}")
+        pr = repo.get_pull(pr_number)
+        double_bumps, conflicts = check_version_lock_double_bumps(
+            repo=repo, file_path="detection_rules/etc/version.lock.json", base_branch="main", branch=pr.head.ref
+        )
+    else:
+        click.echo(f"Using local version lock file: {local_file}")
+        double_bumps, conflicts = check_version_lock_double_bumps(repo=repo, file_path=local_file, base_branch="main")
+
+    if double_bumps or conflicts:
+        click.echo(f"{len(double_bumps)} Double bumps detected")
+        click.echo(f"{len(conflicts)} Version conflicts detected")
+        for rule_id, rule_name, location, version in conflicts:
+            click.echo(f"  {rule_id} ({rule_name}): {location} ships version {version} with different content")
+        if comment and pr_number:
+            comment_body = format_comment_body(double_bumps, conflicts)
+            if pr:
+                _ = pr.create_issue_comment(comment_body)
+        if save_double_bumps:
+            save_double_bumps_to_file(double_bumps, save_double_bumps)
+        ctx.exit(1)
+    else:
+        click.echo(comment_body)
+        if comment and pr_number and pr:
+            _ = pr.create_issue_comment(comment_body)
+
+
+@dataclasses.dataclass
+class GitChangeEntry:
+    status: str
+    original_path: Path
+    new_path: Path | None = None
+
+    @classmethod
+    def from_line(cls, text: str) -> "GitChangeEntry":
+        columns = text.split("\t")
+        if len(columns) not in (2, 3):
+            raise ValueError("Unexpected number of columns")
+        paths = [Path(c) for c in columns[1:]]
+        return cls(columns[0], *paths)
+
+    @property
+    def path(self) -> Path:
+        return self.new_path or self.original_path
+
+    def revert(self, dry_run: bool = False) -> None:
+        """Run a git command to revert this change."""
+
+        def git(*args: Any) -> None:
+            command_line = ["git"] + [str(arg) for arg in args]
+            click.echo(subprocess.list2cmdline(command_line))
+
+            if not dry_run:
+                _ = subprocess.check_call(command_line)
+
+        if self.status.startswith("R"):
+            # renames are actually Delete (D) and Add (A)
+            # revert in opposite order
+            if not self.new_path:
+                raise ValueError("No new path found")
+            GitChangeEntry("A", self.new_path).revert(dry_run=dry_run)
+            GitChangeEntry("D", self.original_path).revert(dry_run=dry_run)
+            return
+
+        # remove the file from the staging area (A|M|D)
+        git("restore", "--staged", self.original_path)
+
+    def read(self, git_tree: str = "HEAD") -> bytes:
+        """Read the file from disk or git."""
+        if self.status == "D":
+            # deleted files need to be recovered from git
+            return subprocess.check_output(["git", "show", f"{git_tree}:{self.path}"])  # noqa: S607
+
+        return self.path.read_bytes()
+
+
+@dev_group.command("unstage-incompatible-rules")
+@click.option("--target-stack-version", "-t", help="Minimum stack version to filter the staging area", required=True)
+@click.option("--dry-run", is_flag=True, help="List the changes that would be made")
+@click.option("--exception-list", help="List of files to skip staging", default="")
+def prune_staging_area(target_stack_version: str, dry_run: bool, exception_list: str) -> None:
+    """Prune the git staging area to remove changes to incompatible rules."""
+    exceptions = {
+        "detection_rules/etc/packages.yaml",
+    }
+    exceptions.update(exception_list.split(","))
+
+    target_stack_version_parsed = Version.parse(target_stack_version, optional_minor_and_patch=True)
+
+    # load a structured summary of the diff from git
+    git_output = subprocess.check_output(["git", "diff", "--name-status", "HEAD"])  # noqa: S607
+    changes = [GitChangeEntry.from_line(line) for line in git_output.decode("utf-8").splitlines()]
+
+    # track which changes need to be reverted because of incompatibilities
+    reversions: list[GitChangeEntry] = []
+
+    for change in changes:
+        if str(change.path) in exceptions:
+            # Don't backport any changes to files matching the list of exceptions
+            reversions.append(change)
+            continue
+
+        # it's a change to a rule file, load it and check the version
+        for rules_dir in RULES_CONFIG.rule_dirs:
+            if str(change.path.absolute()).startswith(str(rules_dir)) and change.path.suffix == ".toml":
+                # bypass TOML validation in case there were schema changes
+                dict_contents = RuleCollection.deserialize_toml_string(change.read())
+                min_stack_version: str | None = dict_contents.get("metadata", {}).get("min_stack_version")
+
+                if min_stack_version is not None and (
+                    target_stack_version_parsed < Version.parse(min_stack_version, optional_minor_and_patch=True)
+                ):
+                    # rule is incompatible, add to the list of reversions to make later
+                    reversions.append(change)
+                break
+
+    if len(reversions) == 0:
+        click.echo("No files restored from staging area")
         return
 
-    rules = [r for r in rule_loader.load_rules(verbose=False).values() if r.id in rule_ids]
-    changed, new = manage_versions(rules, exclude_version_update=True, add_new=False, save_changes=True)
+    click.echo(f"Restoring {len(reversions)} changes from the staging area...")
+    for change in reversions:
+        change.revert(dry_run=dry_run)
+
+
+@dev_group.command("update-lock-versions")
+@click.argument("rule-ids", nargs=-1, required=False)
+@click.pass_context
+@click.option("--force", is_flag=True, help="Force update without confirmation")
+def update_lock_versions(ctx: click.Context, rule_ids: tuple[str, ...], force: bool) -> list[definitions.UUIDString]:
+    """Update rule hashes in version.lock.json file without bumping version."""
+    rules = RuleCollection.default()
+    rules = rules.filter(lambda r: r.id in rule_ids) if rule_ids else rules.filter(production_filter)
+
+    if not force and not click.confirm(
+        f"Are you sure you want to update hashes for {len(rules)} rules without a version bump?"
+    ):
+        return []
+
+    if RULES_CONFIG.bypass_version_lock:
+        click.echo(
+            "WARNING: You cannot run this command when the versioning strategy is configured to bypass the "
+            "version lock. Set `bypass_version_lock` to `False` in the rules config to use the version lock."
+        )
+        ctx.exit()
+
+    # this command may not function as expected anymore due to previous changes eliminating the use of add_new=False
+    changed, _, _ = loaded_version_lock.manage_versions(rules, exclude_version_update=True, save_changes=True)
 
     if not changed:
-        click.echo('No hashes updated')
+        click.echo("No hashes updated")
 
     return changed
 
 
-@dev_group.command('kibana-diff')
-@click.option('--rule-id', '-r', multiple=True, help='Optionally specify rule ID')
-@click.option('--repo', default='elastic/kibana', help='Repository where branch is located')
-@click.option('--branch', '-b', default='master', help='Specify the kibana branch to diff against')
-@click.option('--threads', '-t', type=click.IntRange(1), default=50, help='Number of threads to use to download rules')
-def kibana_diff(rule_id, repo, branch, threads):
+@dev_group.command("kibana-diff")
+@click.option("--rule-id", "-r", multiple=True, help="Optionally specify rule ID")
+@click.option("--repo", default="elastic/kibana", help="Repository where branch is located")
+@click.option("--branch", "-b", default="main", help="Specify the kibana branch to diff against")
+@click.option("--threads", "-t", type=click.IntRange(1), default=50, help="Number of threads to use to download rules")
+def kibana_diff(rule_id: list[str], repo: str, branch: str, threads: int) -> dict[str, Any]:
     """Diff rules against their version represented in kibana if exists."""
     from .misc import get_kibana_rules
 
-    if rule_id:
-        rules = {r.id: r for r in rule_loader.load_rules(verbose=False).values() if r.id in rule_id}
-    else:
-        rules = {r.id: r for r in rule_loader.get_production_rules()}
+    rules = RuleCollection.default()
+    rules = rules.filter(lambda r: r.id in rule_id).id_map if rule_id else rules.filter(production_filter).id_map
 
-    # add versions to the rules
-    manage_versions(list(rules.values()), verbose=False)
-    repo_hashes = {r.id: r.get_hash() for r in rules.values()}
+    repo_hashes = {r.id: r.contents.get_hash(include_version=True) for r in rules.values()}
 
-    kibana_rules = {r['rule_id']: r for r in get_kibana_rules(repo=repo, branch=branch, threads=threads).values()}
-    kibana_hashes = {r['rule_id']: dict_hash(r) for r in kibana_rules.values()}
+    kibana_rules = {r["rule_id"]: r for r in get_kibana_rules(repo=repo, branch=branch, threads=threads).values()}
+    kibana_hashes = {r["rule_id"]: dict_hash(r) for r in kibana_rules.values()}
 
     missing_from_repo = list(set(kibana_hashes).difference(set(repo_hashes)))
     missing_from_kibana = list(set(repo_hashes).difference(set(kibana_hashes)))
 
-    rule_diff = []
-    for rid, rhash in repo_hashes.items():
-        if rid in missing_from_kibana:
+    rule_diff: list[str] = []
+    for _rule_id, _rule_hash in repo_hashes.items():
+        if _rule_id in missing_from_kibana:
             continue
-        if rhash != kibana_hashes[rid]:
+        if _rule_hash != kibana_hashes[_rule_id]:
             rule_diff.append(
-                f'versions - repo: {rules[rid].contents["version"]}, kibana: {kibana_rules[rid]["version"]} -> '
-                f'{rid} - {rules[rid].name}'
+                f"versions - repo: {rules[_rule_id].contents.autobumped_version}, "
+                f"kibana: {kibana_rules[_rule_id]['version']} -> "
+                f"{_rule_id} - {rules[_rule_id].contents.name}"
             )
 
-    diff = {
-        'missing_from_kibana': [f'{r} - {rules[r].name}' for r in missing_from_kibana],
-        'diff': rule_diff,
-        'missing_from_repo': [f'{r} - {kibana_rules[r]["name"]}' for r in missing_from_repo]
+    diff: dict[str, Any] = {
+        "missing_from_kibana": [f"{r} - {rules[r].name}" for r in missing_from_kibana],
+        "diff": rule_diff,
+        "missing_from_repo": [f"{r} - {kibana_rules[r]['name']}" for r in missing_from_repo],
     }
 
-    diff['stats'] = {k: len(v) for k, v in diff.items()}
-    diff['stats'].update(total_repo_prod_rules=len(rules), total_gh_prod_rules=len(kibana_rules))
+    diff["stats"] = {k: len(v) for k, v in diff.items()}
+    diff["stats"].update(total_repo_prod_rules=len(rules), total_gh_prod_rules=len(kibana_rules))
 
     click.echo(json.dumps(diff, indent=2, sort_keys=True))
     return diff
 
 
-@dev_group.command("kibana-commit")
-@click.argument("local-repo", default=get_path("..", "kibana"))
-@click.option("--kibana-directory", "-d", help="Directory to overwrite in Kibana",
-              default="x-pack/plugins/security_solution/server/lib/detection_engine/rules/prepackaged_rules")
-@click.option("--base-branch", "-b", help="Base branch in Kibana", default="master")
-@click.option("--ssh/--http", is_flag=True, help="Method to use for cloning")
-@click.option("--github-repo", "-r", help="Repository to use for the branch", default="elastic/kibana")
-@click.option("--message", "-m", help="Override default commit message")
+@dev_group.command("integrations-pr")
+@click.argument(
+    "local-repo",
+    type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
+    default=get_path(["..", "integrations"]),
+)
+@click.option(
+    "--token",
+    required=True,
+    prompt=get_github_token() is None,
+    default=get_github_token(),
+    help="GitHub token to use for the PR",
+    hide_input=True,
+)
+@click.option(
+    "--pkg-directory",
+    "-d",
+    help="Directory to save the package in cloned repository",
+    default=Path("packages", "security_detection_engine"),
+)
+@click.option("--base-branch", "-b", help="Base branch in target repository", default="main")
+@click.option("--branch-name", "-n", help="New branch for the rules commit")
+@click.option("--github-repo", "-r", help="Repository to use for the branch", default="elastic/integrations")
+@click.option("--assign", multiple=True, help="GitHub users to assign the PR")
+@click.option("--label", multiple=True, help="GitHub labels to add to the PR")
+@click.option("--draft", is_flag=True, help="Open the PR as a draft")
+@click.option("--remote", help="Override the remote from 'origin'", default="origin")
 @click.pass_context
-def kibana_commit(ctx, local_repo, github_repo, ssh, kibana_directory, base_branch, message):
-    """Prep a commit and push to Kibana."""
-    git_exe = shutil.which("git")
+def integrations_pr(  # noqa: PLR0913, PLR0915, PLR0917
+    ctx: click.Context,
+    local_repo: Path,
+    token: str,
+    draft: bool,
+    pkg_directory: str,
+    base_branch: str,
+    remote: str,
+    branch_name: str | None,
+    github_repo: str,
+    assign: tuple[str, ...],
+    label: tuple[str, ...],
+) -> None:
+    """Create a pull request to publish the Fleet package to elastic/integrations."""
+    github = GithubClient(token)
+    github.assert_github()
+    client = github.authenticated_client
+    repo = client.get_repo(github_repo)
 
-    package_name = Package.load_configs()['package']["name"]
-    release_dir = os.path.join(RELEASE_DIR, package_name)
-    message = message or f"[Detection Rules] Add {package_name} rules"
+    # Use elastic-package to format and lint
+    gopath = utils.gopath()
 
-    if not os.path.exists(release_dir):
+    if not gopath:
+        raise ValueError("GOPATH not found")
+
+    gopath = gopath.strip("'\"")
+
+    if not subprocess.check_output(["elastic-package"], stderr=subprocess.DEVNULL):  # noqa: S607
+        raise ValueError(
+            "elastic-package missing, run: go install github.com/elastic/elastic-package@latest and verify go bin path"
+        )
+
+    local_repo = Path(local_repo).resolve()
+    stack_version = Package.load_configs()["name"]
+    package_version = Package.load_configs()["registry_data"]["version"]
+
+    release_dir = RELEASE_DIR / stack_version / "fleet" / package_version
+    message = f"[Security Rules] Update security rules package to v{package_version}"
+
+    if not release_dir.exists():
         click.secho("Release directory doesn't exist.", fg="red", err=True)
-        click.echo(f"Run {click.style('python -m detection_rules build-release', bold=True)} to populate", err=True)
+        click.echo(f"Run {click.style('python -m detection_rules dev build-release', bold=True)} to populate", err=True)
         ctx.exit(1)
 
-    if not git_exe:
-        click.secho("Unable to find git", err=True, fg="red")
+    if not local_repo.exists():
+        click.secho(f"{github_repo} is not present at {local_repo}.", fg="red", err=True)
         ctx.exit(1)
 
-    try:
-        if not os.path.exists(local_repo):
-            if not click.confirm(f"Kibana repository doesn't exist at {local_repo}. Clone?"):
-                ctx.exit(1)
+    # Get the most recent commit hash of detection-rules
+    detection_rules_git = utils.make_git()
+    long_commit_hash = detection_rules_git("rev-parse", "HEAD")
+    short_commit_hash = detection_rules_git("rev-parse", "--short", "HEAD")
 
-            url = f"git@github.com:{github_repo}.git" if ssh else f"https://github.com/{github_repo}.git"
-            subprocess.check_call([git_exe, "clone", url, local_repo, "--depth", 1])
+    # refresh the local clone of the repository
+    git = utils.make_git("-C", local_repo)
+    _ = git("checkout", base_branch)
+    _ = git("pull", remote, base_branch)
 
-        def git(*args, show_output=False):
-            method = subprocess.call if show_output else subprocess.check_output
-            return method([git_exe, "-C", local_repo] + list(args), encoding="utf-8")
+    # Switch to a new branch in elastic/integrations
+    branch_name = branch_name or f"detection-rules/{package_version}-{short_commit_hash}"
+    _ = git("checkout", "-b", branch_name)
 
-        git("checkout", base_branch)
-        git("pull")
-        git("checkout", "-b", f"rules/{package_name}", show_output=True)
-        git("rm", "-r", kibana_directory)
+    # Load the changelog in memory, before it's removed. Come back for it after the PR is created
+    target_directory = local_repo / pkg_directory
+    changelog_path = target_directory / "changelog.yml"
+    changelog_entries: list[dict[str, Any]] = yaml.safe_load(changelog_path.read_text(encoding="utf-8"))
 
-        source_dir = os.path.join(release_dir, "rules")
-        target_dir = os.path.join(local_repo, kibana_directory)
-        os.makedirs(target_dir)
+    changelog_entries.insert(
+        0,
+        {
+            "version": package_version,
+            "changes": [
+                # This will be changed later
+                {
+                    "description": "Release security rules update",
+                    "type": "enhancement",
+                    "link": "https://github.com/elastic/integrations/pulls/0000",
+                }
+            ],
+        },
+    )
 
-        for name in os.listdir(source_dir):
-            _, ext = os.path.splitext(name)
-            path = os.path.join(source_dir, name)
+    # Remove existing assets and replace everything
+    shutil.rmtree(target_directory)
+    actual_target_directory = shutil.copytree(release_dir, target_directory)
+    if Path(actual_target_directory).absolute() != Path(target_directory).absolute():
+        raise ValueError(f"Expected a copy to {pkg_directory}")
 
-            if ext in (".ts", ".json"):
-                shutil.copyfile(path, os.path.join(target_dir, name))
+    # Add the changelog back
+    def save_changelog() -> None:
+        with changelog_path.open("wt") as f:
+            # add a note for other maintainers of elastic/integrations to be careful with versions
+            _ = f.write("# newer versions go on top\n")
+            _ = f.write(
+                "# NOTE: please use pre-release versions (e.g. -beta.0) until a package is ready for production\n"
+            )
+            yaml.dump(changelog_entries, f, allow_unicode=True, default_flow_style=False, indent=2, sort_keys=False)
 
-        git("add", kibana_directory)
+    save_changelog()
 
-        git("commit", "-S", "-m", message)
-        git("status", show_output=True)
+    def elastic_pkg(*args: Any) -> None:
+        """Run a command with $GOPATH/bin/elastic-package in the package directory."""
+        prev = Path.cwd()
+        os.chdir(target_directory)
 
-        click.echo(f"Kibana repository {local_repo} prepped. Push changes when ready")
-        click.secho(f"cd {local_repo}", bold=True)
+        try:
+            elastic_pkg_cmd = [str(Path(gopath, "bin", "elastic-package"))]
+            elastic_pkg_cmd.extend(list(args))
+            _ = subprocess.check_call(elastic_pkg_cmd)
+        finally:
+            os.chdir(str(prev))
 
-    except subprocess.CalledProcessError as e:
-        client_error(e.returncode, e, ctx=ctx)
+    elastic_pkg("format")
+
+    # Upload the files to a branch
+    _ = git("add", pkg_directory)
+    _ = git("commit", "-m", message)
+    _ = git("push", "--set-upstream", remote, branch_name)
+
+    # Create a pull request (not done yet, but we need the PR number)
+    body = textwrap.dedent(f"""
+    ## What does this PR do?
+    Update the Security Rules package to version {package_version}.
+    Autogenerated from commit  https://github.com/elastic/detection-rules/tree/{long_commit_hash}
+
+    ## Checklist
+
+    - [x] I have reviewed [tips for building integrations](https://github.com/elastic/integrations/blob/master/docs/tips_for_building_integrations.md) and this pull request is aligned with them.
+    - [ ] ~I have verified that all data streams collect metrics or logs.~
+    - [x] I have added an entry to my package's `changelog.yml` file.
+    - [x] If I'm introducing a new feature, I have modified the Kibana version constraint in my package's `manifest.yml` file to point to the latest Elastic stack release (e.g. `^7.13.0`).
+
+    ## Author's Checklist
+    - Install the most recently release security rules in the Detection Engine
+    - Install the package
+    - Confirm the update is available in Kibana. Click "Update X rules" or "Install X rules"
+    - Look at the changes made after the install and confirm they are consistent
+
+    ## How to test this PR locally
+    - Perform the above checklist, and use `package-storage` to build EPR from source
+
+    ## Related issues
+    None
+
+    ## Screenshots
+    None
+    """)  # noqa: E501
+
+    pr = repo.create_pull(
+        title=message, body=body, base=base_branch, head=branch_name, maintainer_can_modify=True, draft=draft
+    )
+
+    # labels could also be comma separated
+    cs_labels_split = {lbl for cs_labels in label for lbl in cs_labels.split(",") if lbl}
+
+    labels = sorted(list(label) + list(cs_labels_split))
+
+    if labels:
+        pr.add_to_labels(*labels)
+
+    if assign:
+        pr.add_to_assignees(*assign)
+
+    click.echo("PR created:")
+    click.echo(pr.html_url)
+
+    # replace the changelog entry with the actual PR link
+    changelog_entries[0]["changes"][0]["link"] = pr.html_url
+    save_changelog()
+
+    # format the yml file with elastic-package
+    _ = elastic_pkg("format")
+    _ = elastic_pkg("lint")
+
+    # Push the updated changelog to the PR branch
+    _ = git("add", pkg_directory)
+    _ = git("commit", "-m", f"Add changelog entry for {package_version}")
+    _ = git("push")
 
 
-@dev_group.command('license-check')
-@click.option('--ignore-directory', '-i', multiple=True, help='Directories to skip (relative to base)')
+@dev_group.command("license-check")
+@click.option("--ignore-directory", "-i", multiple=True, help="Directories to skip (relative to base)")
 @click.pass_context
-def license_check(ctx, ignore_directory):
+def license_check(ctx: click.Context, ignore_directory: list[str]) -> None:
     """Check that all code files contain a valid license."""
-    ignore_directory += ("env",)
+    ignore_directory += ("env", ".venv", "venv", "exports")
     failed = False
-    base_path = Path(get_path())
 
-    for path in base_path.rglob('*.py'):
-        relative_path = path.relative_to(base_path)
-        if relative_path.parts[0] in ignore_directory:
+    for path in utils.ROOT_DIR.rglob("*.py"):
+        relative_path = path.relative_to(utils.ROOT_DIR)
+        if relative_path.parts[0] in ignore_directory or "build" in relative_path.parts:
             continue
 
-        with io.open(path, "rt", encoding="utf-8") as f:
+        with path.open(encoding="utf-8") as f:
             contents = f.read()
 
         # skip over shebang lines
@@ -221,490 +871,1268 @@ def license_check(ctx, ignore_directory):
     ctx.exit(int(failed))
 
 
-@dev_group.command('package-stats')
-@click.option('--token', '-t', help='GitHub token to search API authenticated (may exceed threshold without auth)')
-@click.option('--threads', default=50, help='Number of threads to download rules from GitHub')
+@dev_group.command("test-version-lock")
+@click.argument("branches", nargs=-1, required=True)
+@click.option("--remote", "-r", default="origin", help='Override the remote from "origin"')
 @click.pass_context
-def package_stats(ctx, token, threads):
+def test_version_lock(ctx: click.Context, branches: list[str], remote: str) -> None:
+    """Simulate the incremental step in the version locking to find version change violations."""
+    git = utils.make_git("-C", ".")
+    current_branch = git("rev-parse", "--abbrev-ref", "HEAD")
+
+    try:
+        click.echo(f"iterating lock process for branches: {branches}")
+        for branch in branches:
+            click.echo(branch)
+            _ = git("checkout", f"{remote}/{branch}")
+            _ = subprocess.check_call(["python", "-m", "detection_rules", "dev", "build-release", "-u"])  # noqa: S607
+
+    finally:
+        rules_config = ctx.obj["rules_config"]
+        diff = git("--no-pager", "diff", str(rules_config.version_lock_file))
+        outfile = utils.ROOT_DIR / "lock-diff.txt"
+        _ = outfile.write_text(diff)
+        click.echo(f"diff saved to {outfile}")
+
+        click.echo("reverting changes in version.lock")
+        _ = git("checkout", "-f")
+        _ = git("checkout", current_branch)
+
+
+@dev_group.command("package-stats")
+@click.option("--token", "-t", help="GitHub token to search API authenticated (may exceed threshold without auth)")
+@click.option("--threads", default=50, help="Number of threads to download rules from GitHub")
+@click.pass_context
+def package_stats(ctx: click.Context, token: str | None, threads: int) -> None:
     """Get statistics for current rule package."""
-    current_package: Package = ctx.invoke(build_release, verbose=False, release=None)
-    release = f'v{current_package.name}.0'
-    new, modified, errors = rule_loader.load_github_pr_rules(labels=[release], token=token, threads=threads)
+    current_package: Package = ctx.invoke(build_release, verbose=False)
+    release = f"v{current_package.name}.0"
+    new, modified, _ = rule_loader.load_github_pr_rules(labels=[release], token=token, threads=threads)
 
-    click.echo(f'Total rules as of {release} package: {len(current_package.rules)}')
-    click.echo(f'New rules: {len(current_package.new_rules_ids)}')
-    click.echo(f'Modified rules: {len(current_package.changed_rule_ids)}')
-    click.echo(f'Deprecated rules: {len(current_package.removed_rule_ids)}')
+    click.echo(f"Total rules as of {release} package: {len(current_package.rules)}")
+    click.echo(f"New rules: {len(current_package.new_ids)}")
+    click.echo(f"Modified rules: {len(current_package.changed_ids)}")
+    click.echo(f"Deprecated rules: {len(current_package.removed_ids)}")
 
-    click.echo('\n-----\n')
-    click.echo('Rules in active PRs for current package: ')
-    click.echo(f'New rules: {len(new)}')
-    click.echo(f'Modified rules: {len(modified)}')
+    click.echo("\n-----\n")
+    click.echo("Rules in active PRs for current package: ")
+    click.echo(f"New rules: {len(new)}")
+    click.echo(f"Modified rules: {len(modified)}")
 
 
-@dev_group.command('search-rule-prs')
-@click.argument('query', required=False)
-@click.option('--no-loop', '-n', is_flag=True, help='Run once with no loop')
-@click.option('--columns', '-c', multiple=True, help='Specify columns to add the table')
-@click.option('--language', type=click.Choice(["eql", "kql"]), default="kql")
-@click.option('--token', '-t', help='GitHub token to search API authenticated (may exceed threshold without auth)')
-@click.option('--threads', default=50, help='Number of threads to download rules from GitHub')
+@dev_group.command("search-rule-prs")
+@click.argument("query", required=False)
+@click.option("--no-loop", "-n", is_flag=True, help="Run once with no loop")
+@click.option("--columns", "-c", multiple=True, help="Specify columns to add the table")
+@click.option("--language", type=click.Choice(["eql", "kql"]), default="kql")
+@click.option("--token", "-t", help="GitHub token to search API authenticated (may exceed threshold without auth)")
+@click.option("--threads", default=50, help="Number of threads to download rules from GitHub")
 @click.pass_context
-def search_rule_prs(ctx, no_loop, query, columns, language, token, threads):
+def search_rule_prs(  # noqa: PLR0913, PLR0917
+    ctx: click.Context,
+    no_loop: bool,
+    query: str | None,
+    columns: list[str],
+    language: Literal["eql", "kql"],
+    token: str | None,
+    threads: int,
+) -> None:
     """Use KQL or EQL to find matching rules from active GitHub PRs."""
-    from uuid import uuid4
     from .main import search_rules
 
-    all_rules = {}
-    new, modified, errors = rule_loader.load_github_pr_rules(token=token, threads=threads)
+    all_rules: dict[Path, TOMLRule] = {}
+    new, modified, _ = rule_loader.load_github_pr_rules(token=token, threads=threads)
 
-    def add_github_meta(this_rule, status, original_rule_id=None):
+    def add_github_meta(
+        this_rule: TOMLRule,
+        status: str,
+        original_rule_id: definitions.UUIDString | None = None,
+    ) -> None:
         pr = this_rule.gh_pr
-        rule.metadata['status'] = status
-        rule.metadata['github'] = {
-            'base': pr.base.label,
-            'comments': [c.body for c in pr.get_comments()],
-            'commits': pr.commits,
-            'created_at': str(pr.created_at),
-            'head': pr.head.label,
-            'is_draft': pr.draft,
-            'labels': [lbl.name for lbl in pr.get_labels()],
-            'last_modified': str(pr.last_modified),
-            'title': pr.title,
-            'url': pr.html_url,
-            'user': pr.user.login
+        data = rule.contents.data
+        extend_meta = {
+            "status": status,
+            "github": {
+                "base": pr.base.label,
+                "comments": [c.body for c in pr.get_comments()],
+                "commits": pr.commits,
+                "created_at": str(pr.created_at),
+                "head": pr.head.label,
+                "is_draft": pr.draft,
+                "labels": [lbl.name for lbl in pr.get_labels()],
+                "last_modified": str(pr.last_modified),
+                "title": pr.title,
+                "url": pr.html_url,
+                "user": pr.user.login,
+            },
         }
 
         if original_rule_id:
-            rule.metadata['original_rule_id'] = original_rule_id
-            rule.contents['rule_id'] = str(uuid4())
+            extend_meta["original_rule_id"] = original_rule_id
+            data = dataclasses.replace(rule.contents.data, rule_id=str(uuid4()))
 
-        rule_path = f'pr-{pr.number}-{rule.path}'
-        all_rules[rule_path] = rule.rule_format()
+        rule_path = Path(f"pr-{pr.number}-{rule.path}")
+        new_meta = dataclasses.replace(rule.contents.metadata, extended=extend_meta)
+        contents = dataclasses.replace(rule.contents, metadata=new_meta, data=data)
+        new_rule = TOMLRule(path=rule_path, contents=contents)
 
-    for rule_id, rule in new.items():
-        add_github_meta(rule, 'new')
+        if not new_rule.path:
+            raise ValueError("No rule path found")
+        all_rules[new_rule.path] = new_rule
+
+    for rule in new.values():
+        add_github_meta(rule, "new")
 
     for rule_id, rules in modified.items():
         for rule in rules:
-            add_github_meta(rule, 'modified', rule_id)
+            add_github_meta(rule, "modified", rule_id)
 
     loop = not no_loop
     ctx.invoke(search_rules, query=query, columns=columns, language=language, rules=all_rules, pager=loop)
 
     while loop:
-        query = click.prompt(f'Search loop - enter new {language} query or ctrl-z to exit')
-        columns = click.prompt('columns', default=','.join(columns)).split(',')
+        query = click.prompt(f"Search loop - enter new {language} query or ctrl-z to exit")
+        columns = click.prompt("columns", default=",".join(columns)).split(",")
         ctx.invoke(search_rules, query=query, columns=columns, language=language, rules=all_rules, pager=True)
 
 
-@dev_group.command('deprecate-rule')
-@click.argument('rule-file', type=click.Path(dir_okay=False))
+@dev_group.command("deprecate-rule")
+@click.argument("rule-file", type=Path)
+@click.option(
+    "--deprecation-folder", "-d", type=Path, required=True, help="Location to move the deprecated rule file to"
+)
 @click.pass_context
-def deprecate_rule(ctx: click.Context, rule_file: str):
+def deprecate_rule(ctx: click.Context, rule_file: Path, deprecation_folder: Path) -> None:
     """Deprecate a rule."""
-    import pytoml
-    from .packaging import load_versions
+    version_info = loaded_version_lock.version_lock
+    rule_collection = RuleCollection()
+    contents = rule_collection.load_file(rule_file).contents
+    rule = TOMLRule(path=rule_file, contents=contents)  # type: ignore[reportArgumentType]
 
-    version_info = load_versions()
-    rule_file = Path(rule_file)
-    contents = pytoml.loads(rule_file.read_text())
-    rule = TOMLRule(path=rule_file, contents=contents)
-
-    if rule.id not in version_info:
-        click.echo('Rule has not been version locked and so does not need to be deprecated. '
-                   'Delete the file or update the maturity to `development` instead')
+    if rule.contents.id not in version_info and not RULES_CONFIG.bypass_version_lock:
+        click.echo(
+            "Rule has not been version locked and so does not need to be deprecated. "
+            "Delete the file or update the maturity to `development` instead."
+        )
         ctx.exit()
 
-    today = time.strftime('%Y/%m/%d')
-
-    new_meta = dataclasses.replace(rule.contents.metadata,
-                                   updated_date=today,
-                                   deprecation_date=today,
-                                   maturity='deprecated')
-    contents = dataclasses.replace(rule.contents, metadata=new_meta)
-    deprecated_path = get_path('rules', '_deprecated', rule_file.name)
+    today = time.strftime("%Y/%m/%d")
+    deprecated_path = deprecation_folder / rule_file.name
 
     # create the new rule and save it
-    new_rule = TOMLRule(contents=contents, path=Path(deprecated_path))
+    new_meta = dataclasses.replace(
+        rule.contents.metadata, updated_date=today, deprecation_date=today, maturity="deprecated"
+    )
+    contents = dataclasses.replace(rule.contents, metadata=new_meta)
+    new_rule = TOMLRule(contents=contents, path=deprecated_path)
+    deprecated_path.parent.mkdir(parents=True, exist_ok=True)
     new_rule.save_toml()
 
     # remove the old rule
     rule_file.unlink()
-    click.echo(f'Rule moved to {deprecated_path} - remember to git add this file')
+    click.echo(f"Rule moved to {deprecated_path} - remember to git add this file")
 
 
-@dev_group.group('test')
-def test_group():
+@dev_group.command("update-navigator-gists")
+@click.option(
+    "--directory",
+    type=click.Path(exists=True, file_okay=False, dir_okay=True, writable=True, path_type=Path),
+    default=CURRENT_RELEASE_PATH.joinpath("extras", "navigator_layers"),
+    help="Directory containing navigator layer JSON files.",
+)
+@click.option(
+    "--token",
+    required=True,
+    prompt=get_github_token() is None,
+    default=get_github_token(),
+    help="GitHub token to push to gist",
+    hide_input=True,
+)
+@click.option("--gist-id", default=NAVIGATOR_GIST_ID, help="Gist ID to be updated (must exist).")
+@click.option("--print-markdown", is_flag=True, help="Print the generated urls")
+@click.option("--update-coverage", is_flag=True, help=f"Update the {REPO_DOCS_DIR}/ATT&CK-coverage.md file")
+def update_navigator_gists(
+    directory: Path,
+    token: str,
+    gist_id: str,
+    print_markdown: bool,
+    update_coverage: bool,
+) -> list[str]:
+    """Update the gists with new navigator files."""
+
+    def raw_permalink(raw_link: str) -> str:
+        # Gist file URLs change with each revision, but can be permalinked to the latest by removing the hash after raw
+        prefix, _, suffix = raw_link.rsplit("/", 2)
+        return f"{prefix}/{suffix}"
+
+    file_map = select_navigator_gist_files(directory)
+    try:
+        response = update_gist(
+            token, file_map, description="ATT&CK Navigator layer files.", gist_id=gist_id, pre_purge=True
+        )
+    except requests.exceptions.HTTPError as exc:
+        if exc.response is not None and exc.response.status_code == requests.status_codes.codes.not_found:
+            raise raise_client_error(
+                "Gist not found: verify the gist_id exists and the token has access to it", exc=exc
+            ) from exc
+        if exc.response is not None and exc.response.status_code == requests.status_codes.codes.unauthorized:
+            text = json.loads(exc.response.text).get(
+                "message", "verify the token is valid and has the necessary permissions"
+            )
+            error_message = f"Unauthorized: {text}"
+            raise raise_client_error(
+                error_message,
+                exc=exc,
+            ) from exc
+        raise raise_client_error(f"Gist update failed: {exc}", exc=exc) from exc
+
+    response_data = response.json()
+    raw_urls = {name: raw_permalink(data["raw_url"]) for name, data in response_data["files"].items()}
+
+    base_url = "https://mitre-attack.github.io/attack-navigator/#layerURL={}&leave_site_dialog=false&tabs=false"
+    all_url = base_url.format(urllib.parse.quote_plus(raw_urls["Elastic-detection-rules-all.json"]))
+    platforms_url = base_url.format(urllib.parse.quote_plus(raw_urls["Elastic-detection-rules-platforms.json"]))
+
+    generated_urls = [all_url, platforms_url]
+    markdown = [
+        f"**Full coverage**: {NAVIGATOR_BADGE}",
+        "\n",
+        f"**Coverage by platform**: [navigator]({platforms_url})",
+    ]
+
+    if print_markdown:
+        click.echo("\n".join(markdown) + "\n")
+
+    if update_coverage:
+        coverage_file_path = get_path([REPO_DOCS_DIR, "ATT&CK-coverage.md"])
+        header_lines = textwrap.dedent("""# Rule coverage
+
+ATT&CK navigator layer files are generated when a package is built with `make release` or
+`python -m detection-rules`. This also means they can be downloaded from all successful builds.
+
+Published gist links cover the full rule set and coverage by platform. Additional tag and index
+layer files are not uploaded to the gist because they exceed GitHub gist size limits.
+
+## Current rule coverage
+
+The source files for these links are regenerated with every successful merge to main. These represent
+coverage from the state of rules in the `main` branch.
+        """)
+        updated_file = header_lines + "\n\n" + "\n".join(markdown) + "\n"
+        # Replace the old URLs with the new ones
+        with coverage_file_path.open("w") as md_file:
+            _ = md_file.write(updated_file)
+        click.echo(f"Updated ATT&CK coverage URL(s) in {coverage_file_path}" + "\n")
+
+    click.echo(f"Gist update status on {len(generated_urls)} files: {response.status_code} {response.reason}")
+    return generated_urls
+
+
+@dev_group.command("trim-version-lock")
+@click.argument("stack_version")
+@click.option("--skip-rule-updates", is_flag=True, help="Skip updating the rules")
+@click.option("--dry-run", is_flag=True, help="Print the changes rather than saving the file")
+@click.pass_context
+def trim_version_lock(  # noqa: PLR0912, PLR0915
+    ctx: click.Context,
+    stack_version: str,
+    skip_rule_updates: bool,
+    dry_run: bool,
+) -> None:
+    """Trim all previous entries within the version lock file which are lower than the min_version."""
+    stack_versions = get_stack_versions()
+    if stack_version not in stack_versions:
+        raise ValueError(f"Unknown min_version ({stack_version}), expected: {', '.join(stack_versions)}")
+
+    min_version = Version.parse(stack_version)
+
+    if RULES_CONFIG.bypass_version_lock:
+        click.echo(
+            "WARNING: Cannot trim the version lock when the versioning strategy is configured to bypass the "
+            "version lock. Set `bypass_version_lock` to `false` in the rules config to use the version lock."
+        )
+        ctx.exit()
+    version_lock_dict = loaded_version_lock.version_lock.to_dict()
+    removed: dict[str, list[str]] = defaultdict(list)
+    rule_msv_drops: list[str] = []
+
+    today = time.strftime("%Y/%m/%d")
+    rc: RuleCollection | None = None
+    if dry_run:
+        rc = RuleCollection()
+    elif not skip_rule_updates:
+        click.echo("Loading rules ...")
+        rc = RuleCollection.default()
+
+    if not rc:
+        raise ValueError("No rule collection found")
+
+    for rule_id, lock in version_lock_dict.items():
+        file_min_stack: Version | None = None
+        if "min_stack_version" in lock:
+            file_min_stack = Version.parse((lock["min_stack_version"]), optional_minor_and_patch=True)
+            if file_min_stack <= min_version:
+                removed[rule_id].append(
+                    f"locked min_stack_version <= {min_version} - {'will remove' if dry_run else 'removing'}!"
+                )
+                rule_msv_drops.append(rule_id)
+                file_min_stack = None
+
+                if not dry_run:
+                    lock.pop("min_stack_version")
+                    if not skip_rule_updates:
+                        # remove the min_stack_version and min_stack_comments from rules as well (and update date)
+                        rule = rc.id_map.get(rule_id)
+                        if rule:
+                            new_meta = dataclasses.replace(
+                                rule.contents.metadata,
+                                updated_date=today,
+                                min_stack_version=None,
+                                min_stack_comments=None,
+                            )
+                            contents = dataclasses.replace(rule.contents, metadata=new_meta)
+                            new_rule = TOMLRule(contents=contents, path=rule.path)
+                            new_rule.save_toml()
+                            removed[rule_id].append("rule min_stack_version dropped")
+                        else:
+                            removed[rule_id].append("rule not found to update!")
+
+        if "previous" in lock:
+            prev_vers = [Version.parse(v, optional_minor_and_patch=True) for v in list(lock["previous"])]
+            outdated_vers = [v for v in prev_vers if v < min_version]
+
+            if not outdated_vers:
+                continue
+
+            # we want to remove all "old" versions, but save the latest that is >= the min version supplied as the new
+            # stack_version.
+            latest_version = max(outdated_vers)
+
+            for outdated in outdated_vers:
+                short_outdated = f"{outdated.major}.{outdated.minor}"
+                popped = lock["previous"].pop(str(short_outdated))
+                # the core of the update - we only need to keep previous entries that are newer than the min supported
+                # version (from stack-schema-map and stack-version parameter) and older than the locked
+                # min_stack_version for a given rule, if one exists
+                if file_min_stack and outdated == latest_version and outdated < file_min_stack:
+                    lock["previous"][f"{min_version.major}.{min_version.minor}"] = popped
+                    removed[rule_id].append(f"{short_outdated} updated to: {min_version.major}.{min_version.minor}")
+                else:
+                    removed[rule_id].append(f"{outdated} dropped")
+
+            # remove the whole previous entry if it is now blank
+            if not lock["previous"]:
+                lock.pop("previous")
+
+    click.echo(f"Changes {'that will be ' if dry_run else ''} applied:" if removed else "No changes")
+    click.echo("\n".join(f"{k}: {', '.join(v)}" for k, v in removed.items()))
+    if not dry_run:
+        new_lock = VersionLockFile.from_dict({"data": version_lock_dict})
+        new_lock.save_to_file()
+
+
+@dev_group.group("diff")
+def diff_group() -> None:
+    """Commands for statistics on changes and diffs."""
+
+
+@diff_group.command("endpoint-by-attack")
+@click.option("--pre", required=True, help="Tag for pre-existing rules")
+@click.option("--post", required=True, help="Tag for rules post updates")
+@click.option("--force", "-f", is_flag=True, help="Bypass the confirmation prompt")
+@click.option("--remote", "-r", default="origin", help='Override the remote from "origin"')
+@click.pass_context
+def endpoint_by_attack(
+    ctx: click.Context,
+    pre: str,
+    post: str,
+    force: bool,
+    remote: str = "origin",
+) -> tuple[Any, Any, Any]:
+    """Rule diffs across tagged branches, broken down by ATT&CK tactics."""
+    if not force and not click.confirm(
+        f"This will refresh tags and may overwrite local tags for: {pre} and {post}. Continue?"
+    ):
+        ctx.exit(1)
+
+    changed, new, deprecated = get_release_diff(pre, post, remote)
+    oses = ("windows", "linux", "macos")
+
+    def delta_stats(rule_map: dict[str, TOMLRule] | dict[str, DeprecatedRule]) -> list[dict[str, Any]]:
+        stats: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        os_totals: dict[str, int] = defaultdict(int)
+        tactic_totals: dict[str, int] = defaultdict(int)
+
+        for rule in rule_map.values():
+            threat = rule.contents.data.get("threat")
+            os_types: list[str] = [i.lower() for i in rule.contents.data.get("tags") or [] if i.lower() in oses]  # type: ignore[reportUnknownVariableType]
+            if not threat or not os_types:
+                continue
+
+            if isinstance(threat[0], dict):
+                tactics = sorted({e["tactic"]["name"] for e in threat})
+            else:
+                tactics = ThreatMapping.flatten(threat).tactic_names
+            for tactic in tactics:
+                tactic_totals[tactic] += 1
+                for os_type in os_types:
+                    os_totals[os_type] += 1
+                    stats[tactic][os_type] += 1
+
+        # structure stats for table
+        rows: list[dict[str, Any]] = []
+        for tac, stat in stats.items():
+            row: dict[str, Any] = {"tactic": tac, "total": tactic_totals[tac]}
+            for os_type, count in stat.items():
+                row[os_type] = count  # noqa: PERF403
+            rows.append(row)
+
+        rows.append(dict(tactic="total_by_os", **os_totals))
+        return rows
+
+    fields = ["tactic", "linux", "macos", "windows", "total"]
+
+    changed_stats = delta_stats(changed)
+    table = Table.from_list(fields, changed_stats)  # type: ignore[reportUnknownMemberType]
+    click.echo(f"Changed rules {len(changed)}\n{table}\n")
+
+    new_stats = delta_stats(new)
+    table = Table.from_list(fields, new_stats)  # type: ignore[reportUnknownMemberType]
+    click.echo(f"New rules {len(new)}\n{table}\n")
+
+    dep_stats = delta_stats(deprecated)
+    table = Table.from_list(fields, dep_stats)  # type: ignore[reportUnknownMemberType]
+    click.echo(f"Deprecated rules {len(deprecated)}\n{table}\n")
+
+    return changed_stats, new_stats, dep_stats
+
+
+@dev_group.group("test")
+def test_group() -> None:
     """Commands for testing against stack resources."""
 
 
-@test_group.command('event-search')
-@click.argument('query')
-@click.option('--index', '-i', multiple=True, help='Index patterns to search against')
-@click.option('--eql/--lucene', '-e/-l', 'language', default=None, help='Query language used (default: kql)')
-@click.option('--date-range', '-d', type=(str, str), default=('now-7d', 'now'), help='Date range to scope search')
-@click.option('--count', '-c', is_flag=True, help='Return count of results only')
-@click.option('--max-results', '-m', type=click.IntRange(1, 1000), default=100,
-              help='Max results to return (capped at 1000)')
-@click.option('--verbose', '-v', is_flag=True, default=True)
-@add_client('elasticsearch')
-def event_search(query, index, language, date_range, count, max_results, verbose=True,
-                 elasticsearch_client: Elasticsearch = None):
+@test_group.command("event-search")
+@click.argument("query")
+@click.option("--index", "-i", multiple=True, help="Index patterns to search against")
+@click.option("--eql/--lucene", "-e/-l", "language", default=None, help="Query language used (default: kql)")
+@click.option("--date-range", "-d", type=(str, str), default=("now-7d", "now"), help="Date range to scope search")
+@click.option("--count", "-c", is_flag=True, help="Return count of results only")
+@click.option(
+    "--max-results",
+    "-m",
+    type=click.IntRange(1, 1000),
+    default=100,
+    help="Max results to return (capped at 1000)",
+)
+@click.option("--verbose", "-v", is_flag=True, default=True)
+@add_client(["elasticsearch"])
+def event_search(  # noqa: PLR0913, PLR0917
+    query: str,
+    index: list[str],
+    language: str | None,
+    date_range: tuple[str, str],
+    count: bool,
+    max_results: int,
+    elasticsearch_client: Elasticsearch,
+    verbose: bool = True,
+) -> Any | list[Any]:
     """Search using a query against an Elasticsearch instance."""
     start_time, end_time = date_range
-    index = index or ('*',)
-    language_used = "kql" if language is None else "eql" if language is True else "lucene"
+    index = index or ["*"]
+    language_used = "kql" if language is None else "eql" if language else "lucene"
     collector = CollectEvents(elasticsearch_client, max_results)
 
     if verbose:
-        click.echo(f'searching {",".join(index)} from {start_time} to {end_time}')
-        click.echo(f'{language_used}: {query}')
+        click.echo(f"searching {','.join(index)} from {start_time} to {end_time}")
+        click.echo(f"{language_used}: {query}")
 
     if count:
         results = collector.count(query, language_used, index, start_time, end_time)
-        click.echo(f'total results: {results}')
+        click.echo(f"total results: {results}")
     else:
         results = collector.search(query, language_used, index, start_time, end_time, max_results)
-        click.echo(f'total results: {len(results)} (capped at {max_results})')
+        click.echo(f"total results: {len(results)} (capped at {max_results})")
         click.echo_via_pager(json.dumps(results, indent=2, sort_keys=True))
 
     return results
 
 
-@test_group.command('rule-event-search')
-@click.argument('rule-file', type=click.Path(dir_okay=False), required=False)
-@click.option('--rule-id', '-id')
-@click.option('--date-range', '-d', type=(str, str), default=('now-7d', 'now'), help='Date range to scope search')
-@click.option('--count', '-c', is_flag=True, help='Return count of results only')
-@click.option('--max-results', '-m', type=click.IntRange(1, 1000), default=100,
-              help='Max results to return (capped at 1000)')
-@click.option('--verbose', '-v', is_flag=True)
+@test_group.command("rule-event-search")
+@single_collection
+@click.option("--date-range", "-d", type=(str, str), default=("now-7d", "now"), help="Date range to scope search")
+@click.option("--count", "-c", is_flag=True, help="Return count of results only")
+@click.option(
+    "--max-results",
+    "-m",
+    type=click.IntRange(1, 1000),
+    default=100,
+    help="Max results to return (capped at 1000)",
+)
+@click.option("--verbose", "-v", is_flag=True)
 @click.pass_context
-@add_client('elasticsearch')
-def rule_event_search(ctx, rule_file, rule_id, date_range, count, max_results, verbose,
-                      elasticsearch_client: Elasticsearch = None):
+@add_client(["elasticsearch"])
+def rule_event_search(  # noqa: PLR0913, PLR0917
+    ctx: click.Context,
+    rule: Any,
+    date_range: tuple[str, str],
+    count: bool,
+    max_results: int,
+    elasticsearch_client: Elasticsearch,
+    verbose: bool = False,
+) -> None:
     """Search using a rule file against an Elasticsearch instance."""
-    rule: TOMLRule
 
-    if rule_id:
-        rule = get_rule(rule_id, verbose=False)
-    elif rule_file:
-        rule = TOMLRule(path=rule_file, contents=TOMLRuleContents.from_dict(load_dump(rule_file)))
-    else:
-        client_error('Must specify a rule file or rule ID')
-
-    if isinstance(rule.contents.data, BaseQueryRuleData):
+    if isinstance(rule.contents.data, QueryRuleData):
         if verbose:
-            click.echo(f'Searching rule: {rule.name}')
+            click.echo(f"Searching rule: {rule.name}")
 
         data = rule.contents.data
         rule_lang = data.language
 
-        if rule_lang == 'kuery':
+        if rule_lang == "kuery":
             language_flag = None
-        elif rule_lang == 'eql':
+        elif rule_lang == "eql":
             language_flag = True
         else:
             language_flag = False
 
-        index = data.index or ['*']
-        ctx.invoke(event_search, query=data.query, index=index, language=language_flag,
-                   date_range=date_range, count=count, max_results=max_results, verbose=verbose,
-                   elasticsearch_client=elasticsearch_client)
+        index = data.index or ["*"]
+        ctx.invoke(
+            event_search,
+            query=data.query,
+            index=index,
+            language=language_flag,
+            date_range=date_range,
+            count=count,
+            max_results=max_results,
+            verbose=verbose,
+            elasticsearch_client=elasticsearch_client,
+        )
     else:
-        client_error('Rule is not a query rule!')
+        raise_client_error("Rule is not a query rule!")
 
 
-@test_group.command('rule-survey')
-@click.argument('query', required=False)
-@click.option('--date-range', '-d', type=(str, str), default=('now-7d', 'now'), help='Date range to scope search')
-@click.option('--dump-file', type=click.Path(dir_okay=False),
-              default=get_path('surveys', f'{time.strftime("%Y%m%dT%H%M%SL")}.json'),
-              help='Save details of results (capped at 1000 results/rule)')
-@click.option('--hide-zero-counts', '-z', is_flag=True, help='Exclude rules with zero hits from printing')
-@click.option('--hide-errors', '-e', is_flag=True, help='Exclude rules with errors from printing')
+@test_group.command("rule-survey")
+@click.argument("query", required=False)
+@click.option("--date-range", "-d", type=(str, str), default=("now-7d", "now"), help="Date range to scope search")
+@click.option(
+    "--dump-file",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=get_path(["surveys", f"{time.strftime('%Y%m%dT%H%M%SL')}.json"]),
+    help="Save details of results (capped at 1000 results/rule)",
+)
+@click.option("--hide-zero-counts", "-z", is_flag=True, help="Exclude rules with zero hits from printing")
+@click.option("--hide-errors", "-e", is_flag=True, help="Exclude rules with errors from printing")
 @click.pass_context
-@add_client('elasticsearch', 'kibana', add_to_ctx=True)
-def rule_survey(ctx: click.Context, query, date_range, dump_file, hide_zero_counts, hide_errors,
-                elasticsearch_client: Elasticsearch = None, kibana_client: Kibana = None):
+@add_client(["elasticsearch", "kibana"], add_to_ctx=True)
+def rule_survey(  # noqa: PLR0913, PLR0917
+    ctx: click.Context,
+    query: str,
+    date_range: tuple[str, str],
+    dump_file: Path,
+    hide_zero_counts: bool,
+    hide_errors: bool,
+    elasticsearch_client: Elasticsearch,
+    kibana_client: Kibana,
+) -> list[dict[str, int]]:
     """Survey rule counts."""
-    from eql.table import Table
-    from kibana.resources import Signal
-    from . import rule_loader
+
     from .main import search_rules
 
-    survey_results = []
+    survey_results: list[dict[str, int]] = []
     start_time, end_time = date_range
 
     if query:
-        rule_paths = [r['file'] for r in ctx.invoke(search_rules, query=query, verbose=False)]
-        rules = rule_loader.load_rules(rule_loader.load_rule_files(paths=rule_paths, verbose=False), verbose=False)
-        rules = rules.values()
+        rules = RuleCollection()
+        paths = [Path(r["file"]) for r in ctx.invoke(search_rules, query=query, verbose=False)]
+        rules.load_files(paths)
     else:
-        rules = rule_loader.load_rules(verbose=False).values()
+        rules = RuleCollection.default().filter(production_filter)
 
-    click.echo(f'Running survey against {len(rules)} rules')
-    click.echo(f'Saving detailed dump to: {dump_file}')
+    click.echo(f"Running survey against {len(rules)} rules")
+    click.echo(f"Saving detailed dump to: {dump_file}")
 
     collector = CollectEvents(elasticsearch_client)
-    details = collector.search_from_rule(*rules, start_time=start_time, end_time=end_time)
-    counts = collector.count_from_rule(*rules, start_time=start_time, end_time=end_time)
+    details = collector.search_from_rule(rules, start_time=start_time, end_time=end_time)
+    counts = collector.count_from_rule(rules, start_time=start_time, end_time=end_time)
 
     # add alerts
     with kibana_client:
-        range_dsl = {'query': {'bool': {'filter': []}}}
-        add_range_to_dsl(range_dsl['query']['bool']['filter'], start_time, end_time)
-        alerts = {a['_source']['signal']['rule']['rule_id']: a['_source']
-                  for a in Signal.search(range_dsl)['hits']['hits']}
+        range_dsl: dict[str, Any] = {"query": {"bool": {"filter": []}}}
+        add_range_to_dsl(range_dsl["query"]["bool"]["filter"], start_time, end_time)
+        alerts: dict[str, Any] = {
+            a["_source"]["signal"]["rule"]["rule_id"]: a["_source"]
+            for a in Signal.search(range_dsl, size=10000)["hits"]["hits"]  # type: ignore[reportUnknownMemberType]
+        }
 
     for rule_id, count in counts.items():
         alert_count = len(alerts.get(rule_id, []))
         if alert_count > 0:
-            count['alert_count'] = alert_count
+            count["alert_count"] = alert_count
 
         details[rule_id].update(count)
 
-        search_count = count['search_count']
-        if not alert_count and (hide_zero_counts and search_count == 0) or (hide_errors and search_count == -1):
+        search_count = count["search_count"]
+        if (not alert_count and (hide_zero_counts and search_count == 0)) or (hide_errors and search_count == -1):
             continue
 
         survey_results.append(count)
 
-    fields = ['rule_id', 'name', 'search_count', 'alert_count']
-    table = Table.from_list(fields, survey_results)
+    fields = ["rule_id", "name", "search_count", "alert_count"]
+    table = Table.from_list(fields, survey_results)  # type: ignore[reportUnknownMemberType]
 
-    if len(survey_results) > 200:
+    if len(survey_results) > 200:  # noqa: PLR2004
         click.echo_via_pager(table)
     else:
         click.echo(table)
 
-    os.makedirs(get_path('surveys'), exist_ok=True)
-    with open(dump_file, 'w') as f:
+    get_path(["surveys"]).mkdir(exist_ok=True)
+    with dump_file.open("w") as f:
         json.dump(details, f, indent=2, sort_keys=True)
 
     return survey_results
 
 
-@dev_group.group('gh-release')
-def gh_release_group():
-    """Commands to manage GitHub releases."""
+@dev_group.group("utils")
+def utils_group() -> None:
+    """Commands for dev utility methods."""
 
 
-@gh_release_group.command('create-ml')
-@click.argument('directory', type=click.Path(dir_okay=True, file_okay=False))
-@click.option('--gh-token', '-t', default=getdefault('gh_token'))
-@click.option('--repo', '-r', default='elastic/detection-rules', help='GitHub owner/repo')
-@click.option('--release-name', '-n', required=True, help='Name of release')
-@click.option('--description', '-d', help='Description of release to append to default message')
-@click.pass_context
-def create_ml_release(ctx, directory, gh_token, repo, release_name, description):
-    """Create a GitHub release."""
-    import re
+@utils_group.command("get-branches")
+@click.option(
+    "--outfile",
+    "-o",
+    type=Path,
+    default=get_etc_path(["target-branches.yaml"]),
+    help="File to save output to",
+)
+def get_branches(outfile: Path) -> None:
+    branch_list = get_stack_versions(drop_patch=True)
+    target_branches = json.dumps(branch_list[:-1]) + "\n"
+    _ = outfile.write_text(target_branches)
 
-    # ML-DGA-20201129-25
-    pattern = r'^(ML-DGA|ML-experimental-detections)-\d{4}\d{2}\d{2}-\d+$'
-    assert re.match(pattern, release_name), f'release name must match pattern: {pattern}'
-    assert Path(directory).name == release_name, f'directory name must match release name: {release_name}'
 
-    gh_token = gh_token or click.prompt('GitHub token', hide_input=True)
-    client = GithubClient(gh_token)
-    gh_repo = client.authenticated_client.get_repo(repo)
+@dev_group.group("integrations")
+def integrations_group() -> None:
+    """Commands for dev integrations methods."""
 
-    # validate tag name is increment by 1
-    name_prefix, _, version = release_name.rsplit('-', 2)
-    version = int(version)
-    releases = gh_repo.get_releases()
-    max_ver = max([int(r.raw_data['name'].split('-')[-1]) for r in releases
-                   if r.raw_data['name'].startswith(name_prefix)], default=0)
 
-    if version != (max_ver + 1):
-        client_error(f'Last release version was {max_ver}. Release name should end with version: {max_ver + 1}')
+@integrations_group.command("build-manifests")
+@click.option("--overwrite", "-o", is_flag=True, help="Overwrite the existing integrations-manifest.json.gz file")
+@click.option("--integration", "-i", type=str, help="Adds an integration tag to the manifest file")
+@click.option("--prerelease", "-p", is_flag=True, default=False, help="Include prerelease versions")
+def build_integration_manifests(overwrite: bool, integration: str, prerelease: bool = False) -> None:
+    """Builds consolidated integrations manifests file."""
+    click.echo("loading rules to determine all integration tags")
 
-    # validate files
-    if name_prefix == 'ML-DGA':
-        zipped_bundle, description_str = ctx.invoke(validate_ml_dga_asset, directory=directory, repo=repo)
+    def flatten(tag_list: list[str | list[str]] | list[str]) -> list[str]:
+        return list({tag for tags in tag_list for tag in (flatten(tags) if isinstance(tags, list) else [tags])})
+
+    if integration:
+        build_integrations_manifest(overwrite=False, integration=integration, prerelease=prerelease)
     else:
-        zipped_bundle, description_str = ctx.invoke(validate_ml_detections_asset, directory=directory)
-
-    click.confirm('Validation passed, verify output. Continue?')
-
-    if description:
-        description_str = f'{description_str}\n\n----\n\n{description}'
-
-    release = gh_repo.create_git_release(name=release_name, tag=release_name, message=description_str)
-    zip_name = Path(zipped_bundle).name
-
-    click.echo(f'release created at: {release.html_url}')
-
-    # add zipped bundle as an asset to the release
-    click.echo(f'Uploading zip file: {zip_name}')
-    release.upload_asset(zipped_bundle, label=zip_name, name=zip_name, content_type='application/zip')
-
-    # create manifest entry
-    click.echo('creating manifest for release')
-    manifest = Manifest(repo, tag_name=release_name, token=gh_token)
-    manifest.save()
-
-    return release
+        rules = RuleCollection.default()
+        integration_tags = [r.contents.metadata.integration for r in rules if r.contents.metadata.integration]
+        unique_integration_tags = flatten(integration_tags)
+        click.echo(f"integration tags identified: {unique_integration_tags}")
+        build_integrations_manifest(overwrite, rule_integrations=unique_integration_tags)
 
 
-@gh_release_group.command('validate-ml-dga-asset')
-@click.argument('directory', type=click.Path(exists=True, file_okay=False))
-@click.option('--repo', '-r', default='elastic/detection-rules', help='GitHub owner/repo')
-def validate_ml_dga_asset(directory, repo):
-    """"Validate and prep an ML DGA bundle for release."""
-    from .eswrap import expected_ml_dga_patterns
+@integrations_group.command("build-schemas")
+@click.option("--overwrite", "-o", is_flag=True, help="Overwrite the entire integrations-schema.json.gz file")
+@click.option(
+    "--integration", "-i", type=str, help="Adds a single integration schema to the integrations-schema.json.gz file"
+)
+def build_integration_schemas(overwrite: bool, integration: str) -> None:
+    """Builds consolidated integrations schemas file."""
+    click.echo("Building integration schemas...")
 
-    now = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+    start_time = time.perf_counter()
+    if integration:
+        build_integrations_schemas(overwrite=False, integration=integration)
+    else:
+        build_integrations_schemas(overwrite=overwrite)
+        end_time = time.perf_counter()
+        click.echo(f"Time taken to generate schemas: {(end_time - start_time) / 60:.2f} minutes")
 
-    files = list(Path(directory).glob('*'))
-    if len(files) > 5:
-        client_error('Too many files, expected 5')
 
-    click.secho('[*] validated expected number of files', fg='green')
+@integrations_group.command("show-latest-compatible")
+@click.option("--package", "-p", help="Name of package")
+@click.option("--stack_version", "-s", required=True, help="Rule stack version")
+def show_latest_compatible_version(package: str, stack_version: str) -> None:
+    """Prints the latest integration compatible version for specified package based on stack version supplied."""
 
-    # backup files - will re-save sorted to have deterministic hash
-    backup_path = Path(directory).resolve().parent.joinpath(f'backups-{Path(directory).name}-{now.replace(":", "-")}')
-    shutil.copytree(directory, backup_path)
+    packages_manifest = None
+    try:
+        packages_manifest = load_integrations_manifests()
+    except Exception as e:  # noqa: BLE001
+        click.echo(f"Error loading integrations manifests: {e!s}")
+        return
 
-    # validate file names and json and load
-    loaded_contents = {}
-    for name, pattern in expected_ml_dga_patterns.items():
-        path = list(Path(directory).glob(pattern))
-        match_count = len(path)
-        if match_count != 1:
-            client_error(f'Expected filename pattern "{pattern}" for "{name}": {match_count} matches detected')
+    try:
+        version = find_latest_compatible_version(
+            package, "", Version.parse(stack_version, optional_minor_and_patch=True), packages_manifest
+        )
+        click.echo(f"Compatible integration {version=}")
+    except Exception as e:  # noqa: BLE001
+        click.echo(f"Error finding compatible version: {e!s}")
+        return
 
-        file_path = path[0]
+
+@dev_group.group("schemas")
+def schemas_group() -> None:
+    """Commands for dev schema methods."""
+
+
+@schemas_group.command("update-rule-data")
+def update_rule_data_schemas() -> None:
+    classes = [BaseRuleData, *typing.get_args(AnyRuleData)]
+
+    for cls in classes:
+        _ = cls.save_schema()
+
+
+@schemas_group.command("generate")
+@click.option(
+    "--token",
+    required=True,
+    prompt=get_github_token() is None,
+    default=get_github_token(),
+    help="GitHub token to use for the PR",
+    hide_input=True,
+)
+@click.option(
+    "--schema",
+    "-s",
+    required=True,
+    type=click.Choice(["endgame", "ecs", "beats", "endpoint"]),
+    help="Schema to generate",
+)
+@click.option("--schema-version", "-sv", help="Tagged version from TBD. e.g., 1.9.0")
+@click.option("--endpoint-target", "-t", type=str, default="endpoint", help="Target endpoint schema")
+@click.option("--overwrite", is_flag=True, help="Overwrite if versions exist")
+def generate_schema(token: str, schema: str, schema_version: str, endpoint_target: str, overwrite: bool) -> None:
+    """Download schemas and generate flattend schema."""
+    github = GithubClient(token)
+    client = github.authenticated_client
+
+    if schema_version and not Version.parse(schema_version):
+        raise click.BadParameter(f"Invalid schema version: {schema_version}")
+
+    click.echo(f"Generating {schema} schema")
+    if schema == "endgame":
+        if not schema_version:
+            raise click.BadParameter("Schema version required")
+        schema_manager = EndgameSchemaManager(client, schema_version)
+        schema_manager.save_schemas(overwrite=overwrite)
+
+    # ecs, beats and endpoint schemas are refreshed during release
+    # these schemas do not require a schema version
+    if schema == "ecs":
+        download_schemas(refresh_all=True)
+    if schema == "beats":
+        if not schema_version:
+            download_latest_beats_schema()
+            refresh_main_schema()
+        else:
+            download_beats_schema(schema_version)
+
+    # endpoint package custom schemas can be downloaded
+    # this download requires a specific schema target
+    if schema == "endpoint":
+        repo = client.get_repo("elastic/endpoint-package")
+        contents = repo.get_contents("custom_schemas")
+        optional_endpoint_targets = [
+            Path(f.path).name.replace("custom_", "").replace(".yml", "")  # type: ignore[reportUnknownMemberType]
+            for f in contents  # type: ignore[reportUnknownVariableType]
+            if f.name.endswith(".yml") or Path(f.path).name == endpoint_target  # type: ignore[reportUnknownMemberType]
+        ]
+
+        if not endpoint_target:
+            raise click.BadParameter("Endpoint target required")
+        if endpoint_target not in optional_endpoint_targets:
+            raise click.BadParameter(f"""Invalid endpoint schema target: {endpoint_target}
+                                      \n Schema Options: {optional_endpoint_targets}""")
+        download_endpoint_schemas(endpoint_target)
+    click.echo(f"Done generating {schema} schema")
+
+
+@dev_group.group("attack")
+def attack_group() -> None:
+    """Commands for managing Mitre ATT&CK data and mappings."""
+
+
+@attack_group.command("refresh-data")
+def refresh_attack_data() -> dict[str, Any] | None:
+    """Refresh the ATT&CK data file."""
+    data, _ = attack.refresh_attack_data()
+    return data
+
+
+@attack_group.command("refresh-redirect-mappings")
+def refresh_threat_mappings() -> None:
+    """Refresh the ATT&CK redirect file and update all rule threat mappings."""
+    # refresh the attack_technique_redirects
+    click.echo("refreshing data in attack_technique_redirects.json")
+    attack.refresh_redirected_techniques_map()
+
+
+@attack_group.command("update-rules")
+def update_attack_in_rules() -> list[TOMLRule]:
+    """Update threat mappings attack data in all rules."""
+    new_rules: list[TOMLRule] = []
+    redirected_techniques = attack.load_techniques_redirect()
+    today = time.strftime("%Y/%m/%d")
+
+    rules = RuleCollection.default()
+
+    for rule in rules.rules:
+        needs_update = False
+        updated_threat_map: dict[str, ThreatMapping] = {}
+        threat = rule.contents.data.threat or []
+
+        for entry in threat:
+            tactic_id = entry.tactic.id
+            tactic_name = entry.tactic.name
+            technique_ids: list[str] = []
+            technique_names: list[str] = []
+            for technique in entry.technique or []:
+                technique_ids.append(technique.id)
+                technique_names.append(technique.name)
+                if technique.subtechnique:
+                    technique_ids.extend([st.id for st in technique.subtechnique])
+                    technique_names.extend([st.name for st in technique.subtechnique])
+
+            if any(tid for tid in technique_ids if tid in redirected_techniques):
+                needs_update = True
+                click.echo(f"'{rule.contents.name}' requires update - technique ID change for tactic '{tactic_name}'")
+            elif any(
+                tname
+                for tname in technique_names
+                if tname
+                not in [
+                    attack.technique_lookup[str(tid)]["name"]
+                    for tid in technique_ids
+                    if str(tid) in attack.technique_lookup
+                ]
+            ):
+                needs_update = True
+                click.echo(f"'{rule.contents.name}' requires update - technique name change for tactic '{tactic_name}'")
+
+            if needs_update:
+                try:
+                    updated_threat_entry = attack.build_threat_map_entry(tactic_name, *technique_ids)
+                    updated_threat_map[tactic_id] = ThreatMapping.from_dict(updated_threat_entry)
+                except ValueError as exc:
+                    raise ValueError(f"{rule.id} - {rule.name}: {exc}") from exc
+            else:
+                updated_threat_map[tactic_id] = entry
+
+        if needs_update:
+            final_threat_list = list(updated_threat_map.values())
+            final_threat_list.sort(key=lambda x: x.tactic.name)
+
+            new_meta = dataclasses.replace(rule.contents.metadata, updated_date=today)
+            new_data = dataclasses.replace(rule.contents.data, threat=final_threat_list)
+            new_contents = dataclasses.replace(rule.contents, data=new_data, metadata=new_meta)
+            new_rule = TOMLRule(contents=new_contents, path=rule.path)
+            new_rule.save_toml()
+            new_rules.append(new_rule)
+
+    if new_rules:
+        click.echo(f"\nFinished - {len(new_rules)} rules updated!")
+    else:
+        click.echo("No rule changes needed")
+    return new_rules
+
+
+def _remap_threat_entries(  # noqa: PLR0913, PLR0917
+    entries: list[ThreatMapping],
+    vmap: "attack.AttackVersionMap",
+    framework: str,
+    dropped: list[str],
+    target_lookups: "attack.AttackLookups | None" = None,
+    moved: "list[str] | None" = None,
+) -> list[dict[str, Any]]:
+    """Build target-version threat entries; delegates to attack.convert_threat_to_version."""
+    threat_dicts = [entry.to_dict() for entry in entries]
+    return attack.convert_threat_to_version(
+        threat_dicts,
+        source_version=vmap.source_version,
+        target_version=vmap.target_version,
+        framework=framework,
+        vmap=vmap,
+        target_lookups=target_lookups,
+        dropped=dropped,
+        moved=moved,
+    )
+
+
+def _toml_str(value: str) -> str:
+    """Serialize a string as a TOML basic string, escaping backslashes and double quotes."""
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _format_threat_mappings_toml(new_blocks: list[VersionedThreatMapping]) -> str:
+    """Serialize versioned threat mapping blocks to TOML text."""
+    lines: list[str] = []
+    for block in new_blocks:
+        lines.append("[[rule.threat_mappings]]")
+        lines.append(f"framework = {_toml_str(block.framework)}")
+        lines.append(f"version = {_toml_str(block.version)}")
+        for entry in block.threat:
+            lines.append("[[rule.threat_mappings.threat]]")
+            lines.append(f"framework = {_toml_str(entry.framework)}")
+            for tech in entry.technique or []:
+                lines.append("[[rule.threat_mappings.threat.technique]]")
+                lines.append(f"id = {_toml_str(tech.id)}")
+                lines.append(f"name = {_toml_str(tech.name)}")
+                lines.append(f"reference = {_toml_str(tech.reference)}")
+                for sub in tech.subtechnique or []:
+                    lines.append("[[rule.threat_mappings.threat.technique.subtechnique]]")
+                    lines.append(f"id = {_toml_str(sub.id)}")
+                    lines.append(f"name = {_toml_str(sub.name)}")
+                    lines.append(f"reference = {_toml_str(sub.reference)}")
+            lines.append("")
+            lines.append("[rule.threat_mappings.threat.tactic]")
+            lines.append(f"id = {_toml_str(entry.tactic.id)}")
+            lines.append(f"name = {_toml_str(entry.tactic.name)}")
+            lines.append(f"reference = {_toml_str(entry.tactic.reference)}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _insert_tags(text: str, added_tags: list[str]) -> tuple[str, str | None]:
+    """Insert tags into the `tags` array preserving its single- or multi-line form; returns (text, warning)."""
+    lines = text.splitlines(keepends=True)
+    for i, line in enumerate(lines):
+        single = re.match(r"^(tags\s*=\s*\[)(.*)(\]\s*)$", line)
+        if single:
+            existing = single.group(2).rstrip().rstrip(",")
+            additions = ", ".join(_toml_str(t) for t in added_tags)
+            inner = f"{existing}, {additions}" if existing.strip() else additions
+            lines[i] = f"{single.group(1)}{inner}{single.group(3)}"
+            return "".join(lines), None
+        if re.match(r"^tags\s*=\s*\[\s*$", line):
+            end = next((j for j in range(i + 1, len(lines)) if lines[j].strip() == "]"), None)
+            if end is None:
+                return text, "closing ] of the tags array not found; tags not added"
+            # Ensure the last existing element has a trailing comma before inserting
+            prev_stripped = lines[end - 1].rstrip()
+            if prev_stripped and not prev_stripped.endswith((",", "[")):
+                lines[end - 1] = prev_stripped + ",\n"
+            new_tag_lines = [f"    {_toml_str(t)},\n" for t in added_tags]
+            lines = lines[:end] + new_tag_lines + lines[end:]
+            return "".join(lines), None
+    return text, "tags array not found; tags not added"
+
+
+def _patch_toml_minimal(
+    path: Path,
+    today: str,
+    added_tags: list[str],
+    new_blocks: list[VersionedThreatMapping],
+) -> tuple[bool, list[str]]:
+    """Apply targeted TOML edits (updated_date, tags, threat_mappings); returns (applied, warnings)."""
+    text = path.read_text(encoding="utf-8")
+    warnings: list[str] = []
+
+    # The threat_mappings section is replaced by truncate-and-append, so refuse to touch a file
+    # where any other section follows it — that content would otherwise be lost.
+    tm_match = re.search(r"^\[\[rule\.threat_mappings\]\]", text, flags=re.MULTILINE)
+    if tm_match:
+        for sec in re.finditer(r"^\[+\s*([A-Za-z0-9_.\-]+)\s*\]", text[tm_match.start() :], flags=re.MULTILINE):
+            if not sec.group(1).startswith("rule.threat_mappings"):
+                return False, [f"section [{sec.group(1)}] follows [[rule.threat_mappings]]; file left unmodified"]
+
+    # Update the metadata updated_date in-place (first occurrence only)
+    text, n_subs = re.subn(
+        r"^(updated_date\s*=\s*\")[^\"]*\"",
+        rf'\g<1>{today}"',
+        text,
+        count=1,
+        flags=re.MULTILINE,
+    )
+    if not n_subs:
+        warnings.append("updated_date not found; date not updated")
+
+    # Insert new tags into the tags array
+    if added_tags:
+        text, tags_warning = _insert_tags(text, added_tags)
+        if tags_warning:
+            warnings.append(tags_warning)
+
+    # Remove any existing [[rule.threat_mappings]] sections (re-search: earlier edits shift offsets)
+    m = re.search(r"^\[\[rule\.threat_mappings\]\]", text, flags=re.MULTILINE)
+    if m:
+        text = text[: m.start()].rstrip("\n") + "\n"
+
+    # Append new threat_mappings TOML
+    text = text.rstrip("\n") + "\n\n" + _format_threat_mappings_toml(new_blocks)
+
+    _ = path.write_text(text, encoding="utf-8")
+    return True, warnings
+
+
+def _get_source_threat(rule: TOMLRule, framework: str, source_version: str) -> list[ThreatMapping] | None:
+    """Get the source threat mapping for the given framework/version."""
+    if framework == DEFAULT_THREAT_MAPPING_FRAMEWORK and str(source_version) == str(DEFAULT_THREAT_MAPPING_VERSION):
+        return rule.contents.data.threat
+    for block in rule.contents.data.threat_mappings or []:
+        if block.framework == framework and str(block.version) == str(source_version):
+            return block.threat
+    return None
+
+
+@attack_group.command("convert-threat-mappings")
+@click.option("--target-version", "-t", required=True, help="Target framework version to generate (e.g. 19)")
+@click.option(
+    "--source-version",
+    "-s",
+    default=DEFAULT_THREAT_MAPPING_VERSION,
+    show_default=True,
+    help="Source version to convert from (the version stored in the rule `threat` field by default)",
+)
+@click.option(
+    "--framework",
+    default=DEFAULT_THREAT_MAPPING_FRAMEWORK,
+    show_default=True,
+    help="Threat framework to convert",
+)
+@click.option(
+    "--config",
+    "config_paths",
+    multiple=True,
+    type=Path,
+    help="Explicit mapping config file(s) or directory(ies). Defaults to the configured `attack_version_maps_dir`.",
+)
+@click.option("--dry-run", is_flag=True, help="Report what would change without writing any files")
+@click.option(
+    "--overwrite/--no-overwrite",
+    default=True,
+    show_default=True,
+    help="Replace an existing target-version block on a rule (otherwise the rule is skipped)",
+)
+@multi_collection
+def convert_threat_mappings(  # noqa: PLR0912, PLR0913, PLR0915, PLR0917
+    rules: RuleCollection,
+    target_version: str,
+    source_version: str,
+    framework: str,
+    config_paths: tuple[Path, ...],
+    dry_run: bool,
+    overwrite: bool,
+) -> list[TOMLRule]:
+    """Generate a target-version threat mapping from a rule's source mapping (accuracy-first)."""
+    if framework == DEFAULT_THREAT_MAPPING_FRAMEWORK and str(target_version) == str(DEFAULT_THREAT_MAPPING_VERSION):
+        raise click.BadParameter(
+            f"--target-version {target_version} is the baseline stored in the `threat` field; "
+            "generating a versioned block for it would duplicate `threat`."
+        )
+
+    try:
+        vmap = attack.get_attack_version_map(framework, source_version, target_version, list(config_paths) or None)
+    except (FileNotFoundError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    target_lookups: attack.AttackLookups | None = None
+    if vmap.auto_derive_missing:
         try:
-            with open(file_path, 'r') as f:
-                contents = json.dumps(json.load(f), sort_keys=True)
-                loaded_contents[name] = {'contents': contents, 'filename': file_path}
+            target_lookups = attack.build_attack_lookups_for_version(target_version)
+        except FileNotFoundError as exc:
+            raise click.ClickException(
+                f"auto_derive_missing=true requires ATT&CK STIX data for version {target_version!r}: {exc}"
+            ) from exc
 
-                sha256 = hashlib.sha256(contents.encode('utf-8')).hexdigest()
-                click.secho(f'     - sha256: {sha256} - {name}')
+    click.echo(
+        f"Converting {framework} {source_version} -> {target_version} using config: {vmap.path}\n"
+        f"({len(rules)} rules in scope; dry-run={dry_run}; auto_derive_missing={vmap.auto_derive_missing})\n"
+    )
 
-            # re-save sorted
-            with open(file_path, 'w') as f:
-                f.write(contents)
-        except json.JSONDecodeError as e:
-            client_error(f'Invalid JSON in {file_path} file', e)
+    today = time.strftime("%Y/%m/%d")
+    updated_rules: list[TOMLRule] = []
+    skipped_no_source = 0
+    skipped_existing = 0
+    skipped_empty = 0
+    skipped_unpatchable = 0
 
-    model_filename = Path(loaded_contents['model']['filename']).name
-    model_name, _ = model_filename.rsplit('_', maxsplit=1)
+    for rule in rules.rules:
+        source_threat = _get_source_threat(rule, framework, source_version)
+        if not source_threat:
+            skipped_no_source += 1
+            continue
 
-    click.secho('[*] re-saved all files with keys sorted for deterministic hashing', fg='green')
-    click.secho(f'    [+] backups saved to: {backup_path}')
-    click.secho('[*] validated expected naming patterns for all files', fg='green')
-    click.secho('[*] validated json formatting of all files', fg='green')
+        existing_blocks = list(rule.contents.data.threat_mappings or [])
+        has_target = any(b.framework == framework and str(b.version) == str(target_version) for b in existing_blocks)
+        if has_target and not overwrite:
+            skipped_existing += 1
+            continue
 
-    # check manifest for existing things
-    existing_sha = False
-    existing_model_name = False
-    model_hash = hashlib.sha256(loaded_contents['model']['contents'].encode('utf-8')).hexdigest()
-    manifest_hashes = Manifest.get_existing_asset_hashes(repo)
+        dropped: list[str] = []
+        moved: list[str] = []
+        threat_dicts = _remap_threat_entries(source_threat, vmap, framework, dropped, target_lookups, moved)
 
-    for release, file_data in manifest_hashes.items():
-        for file_name, sha in file_data.items():
-            if model_hash == sha:
-                existing_sha = True
-                click.secho(f'[!] hash for model file: "{loaded_contents["model"]["filename"]}" matches: '
-                            f'{release} -> {file_name} -> {sha}', fg='yellow')
+        if not threat_dicts:
+            skipped_empty += 1
+            click.secho(
+                f"  [skip] {rule.name}: no confident {target_version} mapping (dropped: {', '.join(dropped)})",
+                fg="yellow",
+            )
+            continue
 
-            if model_filename == file_name:
-                existing_model_name = True
-                client_error(f'name for model file: "{loaded_contents["model"]["filename"]}" matches: '
-                             f'{release} -> {file_name} -> {file_name}')
+        block = VersionedThreatMapping.from_dict(
+            {"framework": framework, "version": str(target_version), "threat": threat_dicts}
+        )
+        remaining = [
+            b for b in existing_blocks if not (b.framework == framework and str(b.version) == str(target_version))
+        ]
+        new_blocks = sorted([*remaining, block], key=lambda b: (b.framework, b.version))
 
-    if not existing_sha:
-        click.secho(f'[+] validated no existing models matched hashes for: '
-                    f'{loaded_contents["model"]["filename"]}', fg='green')
+        # Collect new tactic tags from the generated block and merge with existing tags.
+        new_tactic_names: list[str] = sorted({str(e["tactic"]["name"]) for e in threat_dicts if e.get("tactic")})
+        existing_tags = list(rule.contents.data.tags or [])
+        added_tags = [f"Tactic: {n}" for n in new_tactic_names if f"Tactic: {n}" not in existing_tags]
 
-    if not existing_model_name:
-        click.secho(f'[+] validated no existing models matched names for: '
-                    f'{loaded_contents["model"]["filename"]}', fg='green')
+        click.echo(f"  [ok]   {rule.name}: generated {target_version} mapping ({len(threat_dicts)} tactic(s))")
+        if moved:
+            click.secho(f"         migrated: {', '.join(moved)}", fg="cyan")
+        if dropped:
+            click.secho(f"         dropped (not in config): {', '.join(dropped)}", fg="yellow")
+        if added_tags:
+            click.secho(f"         tags added: {', '.join(added_tags)}", fg="green")
 
-    # save zip
-    zip_name_no_ext = Path(directory).resolve()
-    zip_name = f'{zip_name_no_ext}.zip'
-    shutil.make_archive(str(zip_name_no_ext), 'zip', root_dir=zip_name_no_ext.parent, base_dir=zip_name_no_ext.name)
-    click.secho(f'[+] zipped folder saved to {zip_name} for release', fg='green')
+        if not dry_run and rule.path:
+            applied, patch_warnings = _patch_toml_minimal(rule.path, today, added_tags, new_blocks)
+            for warning in patch_warnings:
+                click.secho(f"         WARNING: {warning}", fg="red")
+            if not applied:
+                skipped_unpatchable += 1
+                continue
+        updated_rules.append(rule)
 
-    click.secho(f'[!] run `setup-dga-model -d {directory}` to test this on a live stack before releasing', fg='yellow')
-
-    description = {
-        'model_name': model_name + '\n\n----\n\n',
-        'date': now,
-        'model_sha256': model_hash,
-        'For details reference': 'https://github.com/elastic/detection-rules/blob/main/docs/ML_DGA.md'
-    }
-    description_str = '\n'.join([f'{k}: {v}' for k, v in description.items()])
-    click.echo()
-    click.echo(f'[*] description to paste with release:\n\n{description_str}\n')
-
-    return zip_name, description_str
+    click.echo(
+        f"\nFinished - {len(updated_rules)} rule(s) "
+        f"{'would be ' if dry_run else ''}updated; "
+        f"{skipped_no_source} without a {source_version} source mapping, "
+        f"{skipped_existing} with an existing {target_version} block (use --overwrite), "
+        f"{skipped_empty} with no confident mapping."
+        + (f", {skipped_unpatchable} left unmodified (see warnings)" if skipped_unpatchable else "")
+    )
+    return updated_rules
 
 
-@gh_release_group.command('validate-ml-detections-asset')
-@click.argument('directory', type=click.Path(exists=True, file_okay=False))
-def validate_ml_detections_asset(directory):
-    """Validate and prep ML detection rules and jobs before release."""
-    import pytoml
+@attack_group.command("scaffold-version-map")
+@click.option("--target-version", "-t", required=True, help="Target framework version (e.g. 19)")
+@click.option(
+    "--source-version",
+    "-s",
+    default=DEFAULT_THREAT_MAPPING_VERSION,
+    show_default=True,
+    help="Source version (the baseline stored in the rule `threat` field)",
+)
+@click.option("--framework", default=DEFAULT_THREAT_MAPPING_FRAMEWORK, show_default=True, help="Threat framework")
+@click.option("--output", "-o", type=Path, required=True, help="Path to write the mapping config YAML to")
+def scaffold_version_map(target_version: str, source_version: str, framework: str, output: Path) -> Path:
+    """Generate an identity mapping-config skeleton from the loaded ATT&CK data for human curation."""
+    skeleton = attack.build_identity_version_map(framework, source_version, target_version)
+    header_lines = [
+        f"# Auto-generated identity mapping skeleton ({framework} {source_version} to {target_version}).",
+        "# REVIEW REQUIRED: every source id maps to itself, with the target-version name/reference",
+        "# where the id still exists in the target ATT&CK data (source name otherwise).",
+        "# Curate against the target version's real changes before relying on this config:",
+        "#   renamed       -> change the entry 'name'",
+        "#   deprecated    -> map the entry to a null value, which drops it during conversion",
+        "#   split/merged  -> point the source id at the chosen target id/name/reference",
+        "# Entries absent from this file are dropped during conversion (accuracy-first).",
+        "",
+    ]
+    header = "\n".join(header_lines)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    _ = output.write_text(header + yaml.safe_dump(skeleton, sort_keys=False, default_flow_style=False))
+    click.echo(
+        f"Wrote {framework} {source_version}->{target_version} skeleton to {output} "
+        f"({len(skeleton['tactics'])} tactics, {len(skeleton['techniques'])} techniques, "
+        f"{len(skeleton['subtechniques'])} subtechniques)."
+    )
+    return output
 
-    now = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
 
-    all_files = list(Path(directory).glob('*'))
-    job_paths = [f for f in all_files if f.suffix == '.json']
-    rule_paths = [f for f in all_files if f.suffix == '.toml']
-    other_paths = [f for f in Path(directory).glob('*') if f.suffix not in ('.toml', '.json')]
-    job_count = len(job_paths)
-    rule_count = len(rule_paths)
-    other_count = len(other_paths)
+@dev_group.group("atlas")
+def atlas_group() -> None:
+    """Commands for managing MITRE ATLAS data and mappings."""
 
-    if 'readme.md' not in [f.name.lower() for f in other_paths]:
-        client_error('Release is missing readme file')
 
-    for job in job_paths:
-        try:
-            with open(job, 'r') as f:
-                j = json.load(f)
-                assert j.get('name'), click.style(f'[!] job file "{job}" missing: name', fg='red')
-                assert j.get('type'), click.style(f'[!] job file "{job}" missing: type', fg='red')
-                assert j.get('body'), click.style(f'[!] job file "{job}" missing: body', fg='red')
-        except json.JSONDecodeError as e:
-            client_error(f'Invalid JSON in {job} file', e)
+@atlas_group.command("refresh-data")
+def refresh_atlas_data() -> dict[str, Any] | None:
+    """Refresh the versioned ATLAS data file (atlas-v*.json.gz), same pattern as ATT&CK."""
+    data, _ = atlas.refresh_atlas_data()
+    return data
 
-    click.secho(f'[*] validated json formatting and required fields in {job_count} job files', fg='green')
 
-    for rule in rule_paths:
-        with open(rule, 'r') as f:
-            try:
-                pytoml.load(f)
-            except pytoml.TomlError as e:
-                client_error(f'[!] invalid rule toml for: {rule}', e)
+@dev_group.group("transforms")
+def transforms_group() -> None:
+    """Commands for managing TOML [transform]."""
 
-    click.secho(f'[*] validated toml formatting for {rule_count} rule files', fg='green')
 
-    # save zip
-    zip_name_no_ext = Path(directory).resolve()
-    zip_name = f'{zip_name_no_ext}.zip'
-    shutil.make_archive(str(zip_name_no_ext), 'zip', root_dir=zip_name_no_ext.parent, base_dir=zip_name_no_ext.name)
-    click.secho(f'[+] zipped folder saved to {zip_name} for release', fg='green')
+def guide_plugin_convert_(
+    contents: str | None = None,
+    default: str | None = "",
+) -> dict[str, dict[str, list[str]]] | None:
+    """Convert investigation guide plugin format to toml"""
+    contents = contents or click.prompt("Enter plugin contents", default=default)
+    if not contents:
+        return None
 
-    click.secho('[!] run `kibana upload-rule` to test rules on a live stack before releasing', fg='green')
-    click.secho('[!] run `es upload-ml-job` to test jobs on a live stack before releasing', fg='green')
+    parsed = re.match(r"!{(?P<plugin>\w+)(?P<data>{.+})}", contents.strip())
+    if not parsed:
+        raise ValueError("No plugin name found")
+    try:
+        plugin = parsed.group("plugin")
+        data = parsed.group("data")
+    except AttributeError as e:
+        raise raise_client_error("Unrecognized pattern", exc=e) from e
+    loaded = {"transform": {plugin: [json.loads(data)]}}
+    click.echo(pytoml.dumps(loaded))  # type: ignore[reportUnknownMemberType]
+    return loaded
 
-    description = {
-        'Experimental rules': rule_count,
-        'Experimental ML jobs': job_count,
-        'Other files': str(other_count) + '\n\n----\n\n',
-        'DGA release': '<add link to DGA release these detections were built on>',
-        'date': now,
-        'For details reference': 'https://github.com/elastic/detection-rules/blob/main/docs/ML_DGA.md'
-    }
-    description_str = '\n'.join([f'{k}: {v}' for k, v in description.items()])
-    click.echo()
-    click.echo(f'description to paste with release:\n\n{description_str}\n')
 
-    return zip_name, description_str
+@transforms_group.command("guide-plugin-convert")
+def guide_plugin_convert(
+    contents: str | None = None, default: str | None = ""
+) -> dict[str, dict[str, list[str]]] | None:
+    """Convert investigation guide plugin format to toml."""
+    return guide_plugin_convert_(contents=contents, default=default)
+
+
+@transforms_group.command("guide-plugin-to-rule")
+@click.argument("rule-path", type=Path)
+@click.pass_context
+def guide_plugin_to_rule(ctx: click.Context, rule_path: Path, save: bool = True) -> TOMLRule:
+    """Convert investigation guide plugin format to toml and save to rule."""
+    rc = RuleCollection()
+    rule = rc.load_file(rule_path)
+
+    transforms: dict[str, list[Any]] = defaultdict(list)
+    existing_transform: RuleTransform | None = rule.contents.transform  # type: ignore[reportAssignmentType]
+    transforms.update(existing_transform.to_dict() if existing_transform else {})
+
+    click.secho("(blank line to continue)", fg="yellow")
+    while True:
+        loaded = ctx.invoke(guide_plugin_convert)
+        if not loaded:
+            break
+
+        data = loaded["transform"]
+        for plugin, entries in data.items():
+            transforms[plugin].extend(entries)
+
+    transform = RuleTransform.from_dict(transforms)
+    new_contents = TOMLRuleContents(data=rule.contents.data, metadata=rule.contents.metadata, transform=transform)  # type: ignore[reportArgumentType]
+    updated_rule = TOMLRule(contents=new_contents, path=rule.path)
+
+    if save:
+        updated_rule.save_toml()
+
+    return updated_rule

@@ -1,0 +1,116 @@
+# detection-rules config file
+bbr_rules_dirs:
+  - ../../rules_building_block
+rule_dirs:
+  - ../../rules
+files:
+  deprecated_rules: deprecated_rules.json
+  packages: packages.yaml
+  stack_schema_map: stack-schema-map.yaml
+  version_lock: version.lock.json
+normalize_kql_keywords: False
+# Set the versioning strategy.
+# 1. Set to False to use version.lock.json file
+# 2. Set to True to either:
+#   - Explicitly set within rule.version in the TOML file
+#   - Defer to kibana versions (never manually set)
+# bypass_version_lock: false
+
+# directories:
+  # action_dir: actions
+  # exception_dir: exceptions
+  # action_connector_dir: action_connectors
+
+# to set up a custom rules directory, copy this file to the root of the custom rules directory, which is set
+#   using the environment variable CUSTOM_RULES_DIR
+#   example structure:
+#     custom-rules
+#     ├── _config.yaml
+#     └── rules
+#         ├── example_rule_1.toml
+#         ├── example_rule_2.toml
+#     └── etc
+#         ├── deprecated_rules.json
+#         ├── packages.yaml
+#         ├── stack-schema-map.yaml
+#         └── version.lock.json
+#     └── actions
+##         ├── action_1.toml
+##         ├── action_2.toml
+#     └── exceptions
+##         ├── exception_1.toml
+##         ├── exception_2.toml
+#
+#   update custom-rules/_config.yaml with:
+#     deprecated_rules: etc/deprecated_rules.json
+#     packages: etc/packages.yaml
+#     stack_schema_map: etc/stack-schema-map.yaml
+#     version_lock: etc/version.lock.json
+#
+#   the paths in this file are relative to the custom rules directory (CUSTOM_RULES_DIR/)
+#
+# Refer to each original source file for purpose and proper formatting
+#
+
+# testing:
+#   config: etc/example_test_config.yaml
+
+# To turn on automatic schema generation for non-ecs fields via custom schemas use a line like the following.
+# This will generate a schema file in the specified location that will be used to add entries for each field
+# and index combination that is not already in a known schema. This will also automatically add it to your
+# stack-schema-map.yaml file when using a custom rules directory and config.
+# auto_gen_schema_file: "etc/auto-gen-schema.json"
+
+# Optional Elastic validation bypasses (each true value sets the matching DR_BYPASS_* env var at load time).
+#
+# 1) Enable every bypass at once:
+# bypass_optional_elastic_validation: true
+#
+# 2) Or set only the bypasses you need (ignored if bypass_optional_elastic_validation is true):
+# bypass_note_validation_and_parse: true    # DR_BYPASS_NOTE_VALIDATION_AND_PARSE
+# bypass_bbr_lookback_validation: true      # DR_BYPASS_BBR_LOOKBACK_VALIDATION
+# bypass_tags_validation: true               # DR_BYPASS_TAGS_VALIDATION
+# bypass_timeline_template_validation: true   # DR_BYPASS_TIMELINE_TEMPLATE_VALIDATION
+# bypass_esql_keep_validation: true          # DR_BYPASS_ESQL_KEEP_VALIDATION
+# bypass_esql_metadata_validation: true      # DR_BYPASS_ESQL_METADATA_VALIDATION
+#
+# Each must be true or false if present; omitted keys default to false.
+
+# This points to the testing config file (see example under detection_rules/etc/example_test_config.yaml)
+# This can either be set here or as the environment variable `DETECTION_RULES_TEST_CONFIG`, with precedence
+#   going to the environment variable if both are set. Having both these options allows for configuring testing on
+#   prebuilt Elastic rules without specifying a rules _config.yaml.
+#
+# If set in this file, the path should be relative to the location of this config. If passed as an environment variable,
+#    it should be the full path
+# Note: Using the `custom-rules setup-config <name>` command will generate a config called `test_config.yaml`
+
+# To prevent the tactic prefix from being added to the rule filename, set the line below to True
+# This config line can be used instead of specifying the `--no-tactic-filename` flag in the CLI
+# Mind that for unit tests, you also want to disable the filename test in the test_config.yaml
+# no_tactic_filename: True
+
+# Multi-version threat mappings (e.g. MITRE ATT&CK v18/v19)
+# ---------------------------------------------------------
+# Rules may carry additional framework/version-tagged threat mappings in the `threat_mappings` field
+# alongside the default `threat` field. At build time exactly one mapping is emitted as the API
+# `threat`. The version emitted is chosen automatically based on the target stack:
+#   stack <= 9.4  ->  v18 (the baseline stored in `threat`)
+#   stack >= 9.5  ->  v19 (auto-converted from baseline via STIX/version maps, or an explicit
+#                         `threat_mappings` override when present)
+# Tactic tags are rewritten to match the emitted threat mapping.
+#
+# Versioning uses `stack_emit` epochs in version.lock.json so 9.5+ packages can bump independently
+# of ≤9.4 baseline versions without min-stacking rules. See docs-dev/multi-version-threat-mappings.md.
+#
+# Override the framework/version explicitly with the keys below or the DR_THREAT_MAPPING_FRAMEWORK /
+# DR_THREAT_MAPPING_VERSION environment variables (env vars take precedence over the keys). Setting
+# a version explicitly through either source pins it and suppresses auto-promotion, so e.g.
+# `threat_mapping_version: "18"` keeps v18 output even for stacks >= 9.5:
+# threat_mapping_framework: "MITRE ATT&CK"
+# threat_mapping_version: "18"
+#
+# Directory of per-pair mapping configs used by `dev attack convert-threat-mappings`. Defaults to the
+# stock detection_rules/etc/attack-version-maps directory; point this at your own directory to ship
+# custom source->target mappings with a custom rules repo (paths are relative to this config file).
+# attack_version_maps_dir: etc/attack-version-maps

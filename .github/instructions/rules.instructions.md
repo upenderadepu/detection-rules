@@ -1,0 +1,239 @@
+---
+applyTo:
+  - rules/**/*.toml
+  - rules_building_block/**/*.toml
+---
+
+
+You are a **detection engineer**. Your task is to **review pull requests** (PRs) to improve the quality of detection rules in the `detection-rules` repository. Take your time, think carefully, and perform a thorough review before writing any suggestions.
+
+This repository supports multiple query languages (**KQL**, **EQL**, **ES|QL**) and multiple rule types (**query**, **eql**, **esql**, **threshold**, **new_terms**, **threat_match**, **machine_learning**). Each has distinct fields, constraints, and performance implications. Review accordingly.
+
+There are different types of pull requests:
+
+- **New rule:** The PR name often starts with `[New Rule]`
+- **Tuning an existing rule:** The PR name often starts with `[Tuning]`
+- **Deprecating a rule:** The PR name often starts with `[Deprecation]`
+- **New/tuning hunt:** The PR name often starts with `[Hunt]`
+- **Mixed PRs:** May combine tuning, new rules, or deprecations
+
+For each rule `.toml` file in the PR, review the **metadata**, **rule fields**, and **query** sections and their respective "metadata" and "rule" TOML tables and "query" key using the following guidance:
+
+---
+
+### <Metadata>
+
+- Report typos in `rule.name` and `rule.description`.
+- For new rules, `creation_date` should match the date the PR was first opened.
+- `updated_date` should match `creation_date` for new rules, and the date the PR was opened for tunings.
+- Deprecations happen across **two separate PRs in two releases**:
+  - **First PR (release N):** Prepend `"Deprecated - "` to `rule.name` and references to the rule name, such as `### Investigating <rule.name>`. The rule stays at its current maturity. No other field changes besides `updated_date`.
+  - **Second PR (release N+1):** Set `maturity = "deprecated"`, add `deprecation_date`, and move the rule to `rules/_deprecated/`.
+    - `updated_date` and `deprecation_date` should match the date of the current PR merge. 
+- Assess and suggest a better `rule.name` if the existing name does not accurately reflect the rule's query logic and detection scope.
+- Assess and suggest improvements to `rule.description` — limit to two or three sentences that clearly summarize the query logic and detection scope.
+- `min_stack_version` should support the widest stack versions unless the rule uses features exclusive to a newer stack version.
+- If `min_stack_comments` is set, verify it explains why `min_stack_version` is restricted.
+- Report any inconsistencies in the **MITRE ATT&CK** mappings: missing relevant techniques, unrelated techniques, or missing subtechniques where applicable. When possible, suggest the most accurate and up-to-date technique/subtechnique mappings based on the query logic.
+- Review the **references** section and report inconsistencies between referenced content and the rule's description or logic.
+
+</Metadata>
+
+---
+
+### <Rule Fields>
+
+#### Common Fields (All Rule Types)
+
+- `risk_score` should align with `severity`:
+  - `low` → 21
+  - `medium` → 47
+  - `high` → 73
+  - `critical` → 99
+- `tags` must follow the XDR/SIEM tag taxonomy (`Category: Value`). Review tags against the checklist below and suggest missing or incorrect tags. Keep suggestions to 1–2 sentences; list concrete tag strings to add/fix.
+  - See also `docs-dev/rule-tag-taxonomy.md` for the full vocabulary and design notes.
+  - **Compatibility:** Keep currently enforced tags that unit tests require (for example `Domain: Containers`, dual AWS data-source tags). Prefer additive suggestions for new categories (`Platform:`, `Service:`, `Vuln:`, `Profile:`) rather than renaming legacy values mid-migration.
+
+  **Required (suggest if missing):**
+  - `Domain:` — at least one attack-surface tag. Allowed: `Endpoint`, `Cloud`, `Containers`, `Network`, `Identity`, `SaaS`, `Email`, `GenAI`, `OT/IoT`. Multi-domain rules may have multiple. Use `Domain: GenAI` for detections of threats against/via GenAI systems. Add `Mitre Atlas:` technique tags when a technique exists; when ATLAS has no technique, map the tactic only in `threat_mappings`. A rule that calls a model is `Resources: LLM`.
+  - `Platform:` — at least one target ecosystem (distinct from data source). Examples: `AWS`, `Azure`, `Entra ID`, `GCP`, `Google Workspace`, `Microsoft 365`, `Okta`, `GitHub`, `Kubernetes`, `Windows`, `Linux`, `macOS`, `Wiz`.
+  - `Tactic:` — one tag per MITRE ATT&CK tactic in `[[rule.threat]]` (must match threat mapping names).
+  - `Rule Type:` — at least one construction/behavior tag aligned to the rule engine type:
+    - `esql` → `Rule Type: ES|QL`
+    - `query` / KQL → `Rule Type: Custom Query (KQL)`
+    - `saved_query` → `Rule Type: Custom Query (KQL)`
+    - `eql` → `Rule Type: Event Correlation (EQL)`
+    - `threat_match` → prefer `Rule Type: Indicator Match` (taxonomy); legacy `Rule Type: Threat Match` is still valid — suggest Indicator Match but do not treat Threat Match as an error
+    - `threshold` → `Rule Type: Threshold`
+    - `new_terms` → `Rule Type: New Terms`
+    - `machine_learning` → both `Rule Type: Machine Learning` and `Rule Type: ML`
+    - Building blocks → `Rule Type: BBR`
+    - Higher-order / signal-correlating → `Rule Type: Higher-Order` (legacy spelling `Higher-Order Rule` is still valid)
+  - `OS:` — required when the rule lives under `rules/windows|linux|macos/` or is endpoint-scoped: `OS: Windows`, `OS: Linux`, `OS: macOS`.
+  - `Data Source:` — telemetry origin matching integrations/index patterns (not the platform name alone). Prefer specific streams when known (e.g. `Data Source: Azure Platform Logs`, `Data Source: Azure Activity Logs`, `Data Source: Elastic Defend`, `Data Source: AWS CloudTrail`, `Data Source: Entra ID Sign-In Logs`). Preserve any dual/legacy tags still required by tests (e.g. AWS + Amazon Web Services, `Data Source: Crowdstrike`, `Data Source: SentinelOne`, `Data Source: Sysmon`). Use spellings from `EXPECTED_RULE_TAGS`. **Do not** suggest a second tag that only appends `Logs` (`SentinelOne Logs`, `Windows Sysmon Logs`) or `CrowdStrike Falcon Logs` — CrowdStrike stays `Crowdstrike` or `CrowdStrike Falcon`, never `… Falcon Logs`.
+  - `Resources: Investigation Guide` if `note` contains an investigation guide.
+  - **`Resources: LLM` — user-visible label that the rule calls an LLM.** Required when the query uses ES|QL `| COMPLETION`. This is how users find inference-backed rules (EIS / connector + token cost). Keep the existing attack-surface `Domain:` tags (`Endpoint`, `Identity`, and so on). Do **not** add `Resources: LLM` to GenAI-threat rules that do not invoke `COMPLETION`, and do **not** add `Domain: GenAI` only because the query calls a model.
+  - `Mitre Atlas: AML.Txxxx` (or short `Txxxx`) for GenAI-domain rules when an ATLAS technique applies. IDs must exist in the current ATLAS data — do not use OWASP LLM Top 10 labels (`LLM04`, `LLM06`, …). When no technique fits, add a tactic-only `[[rule.threat_mappings]]` entry and leave this tag off.
+
+  **Optional (suggest when clearly applicable):**
+  - `Service:` — specific component (prefix cloud services with vendor): e.g. `Service: AWS S3`, `Service: Azure Key Vault`, `Service: AWS Bedrock`, `Service: GitHub Actions`, `Service: IIS`, `Service: Nginx`.
+  - `Vuln: CVE-YYYY-NNNNN` — only when the rule targets exploitation of a specific CVE.
+  - `Threat:` — either (a) a named exploit/campaign/malware the rule specifically targets (e.g. `Threat: Log4Shell`, `Threat: Cobalt Strike`), or (b) a managed operational category from `EXPECTED_RULE_TAGS` when the match is clear (e.g. `Threat: Brute Force`, `Threat: Living off the Land`, `Threat: Vulnerable Driver`). Do **not** invent adversary-group or malware-family tags on generic behavioral rules, and do not invent near-synonyms of catalog values. Do **not** use a targeted company's name as a threat tag.
+  - `Profile: Beta` when the rule is explicitly beta. Do **not** invent `Profile: Recommended` / `Profile: Aggressive`, `Noise:*`, or `Performance:*` — those are fleet-telemetry derived.
+  - `Resources: Workflow` / `Resources: Osquery` when those artifacts are present.
+
+  **Do not suggest:**
+  - Untagged free-text keywords or prefixes outside the taxonomy.
+  - Using `Domain:` for storage, middleware/web servers, or threat intel (use `Service:` / `Rule Type:` instead).
+  - Treating `Platform:` and `Data Source:` as interchangeable.
+  - A second `Data Source:` that only appends `Logs` to an existing vendor tag (`SentinelOne Logs`, `Windows Sysmon Logs`, `CrowdStrike Falcon Logs`). Keep `SentinelOne`, `Sysmon`, `Crowdstrike` / `CrowdStrike Falcon`.
+  - Hand-authoring `Noise:`, `Performance:`, or `Profile: Recommended|Aggressive` without the telemetry pipeline.
+- `index` patterns should be neither too specific nor too vague — they must accurately match the relevant data stream (e.g., `logs-endpoint.events.process-*` for process events, not `logs-endpoint.events.*` unless multiple event types are needed).
+- `from` and `interval` should not create gaps. The lookback window (`from`) must cover at least the `interval` period. The default `interval` period, if not explicitly changed, is 5 minutes. 
+- `timestamp_override` should be set to `"event.ingested"` for most rules to avoid ingestion delay issues.
+- `max_signals` defaults to 100. Only override with justification.
+
+#### Investigation Guide (`note` field)
+
+- If present, the note should include actionable triage steps, false positive guidance, and response/remediation steps.
+- When OSQuery queries are included in investigation guides, validate their syntax and ensure the referenced tables and columns are correct.
+- The `setup` field should include necessary steps to configure the integration or data source.
+- Check for typos in the investigation guide content.
+
+#### Building Block Rules
+
+- Must be placed in the `rules_building_block/` directory.
+- Must have a `risk_score` of `21` and `severity` of `"low"`.
+
+#### Alert Suppression
+
+- Verify the suppression `group_by` fields are meaningful for deduplication.
+
+#### Threshold Rules
+
+- Verify the `threshold.value` is meaningful and not too low (noisy) or too high (misses detections).
+- When `threshold.cardinality` is used, verify the cardinality field and value make sense for the detection logic.
+
+#### New Terms Rules
+
+- `history_window_start` should be appropriate for the detection context (typically 5–10 days) longer values may impact performance.
+- Verify the `new_terms_fields` combination makes semantic sense — detecting "first seen" on arbitrary field combinations can produce excessive noise.
+- Assess whether it is truly necessary to leverage multiple `new_terms_fields` keys, as each newly added key negatively impacts performance.
+
+#### Threat Match Rules
+
+- `threat_indicator_path` should be set (default: `threat.indicator`).
+- `from` and `interval` for threat match rules are typically wider (e.g., `from: "now-65m"`, `interval: "1h"`) due to indicator matching overhead.
+
+#### Machine Learning Rules
+
+- `setup` should document the required ML job installation steps.
+
+</Rule Fields>
+
+---
+
+### <Query — All Languages>
+
+- Review for typos in known system file names (e.g., `WmiPrvS.exe` instead of `WmiPrvSe.exe`).
+- Ensure the **query logic aligns with the rule description** (e.g., the description says "Detect Certutil abuse," but the query looks for `svchost.exe`).
+- Verify there are no duplicate entries in the query (e.g., same exclusion listed twice).
+- Flag risky false-positive exclusions (e.g., `not file.path : "C:\\Users\\*"` — paths under `Users` are world-writable and attacker-controlled).
+- **Sensitive / customer-identifying paths (required on every rule PR):** For every **added or changed** exclusion (process/file/parent path, command-line pattern, args, working directory, registry path, etc.), check whether it looks like sensitive or customer-specific information rather than a generic third-party product install. Flag and request changes when the pattern includes or fingerprints:
+  - Usernames, hostnames, emails, org/company names, cluster UUIDs, agent IDs, IP addresses, or other environment identifiers
+  - Internal workspace or repo layouts (e.g. `/home/*/work/zzyzx-batch-runner*`, `/var/tmp/qorvex-ci/*`, `?:\\Build\\NimblefoxApp\\out\\*`)
+  - Credentials, tokens, API keys, passwords, or private-key material (values or unique secret-looking blobs — not generic detection keywords like `*password*`)
+  - Product or tool paths that appear customer-internal / single-tenant rather than a widely distributed vendor install (prefer `Program Files\\Vendor\\*`, `/opt/vendor/*`, `/home/*/.example-tool/bin/*` style patterns; require multi-cluster telemetry evidence before accepting obscure product names)
+  Prefer rewriting to a **generic, non-identifying** vendor/install pattern, or drop the exclusion if it cannot be made generic. Do not approve shipping customer-environment fingerprints into published rules.
+- **Sensitive cloud and SaaS identifiers (required on every cloud, identity, and SaaS rule PR):** Apply the same bar to identifiers in `rules/integrations/**` queries (AWS, Azure / Entra ID, GCP, Microsoft 365, Okta, Google Workspace, GitHub, Kubernetes, and similar). A hard-coded identifier is acceptable only when it is **vendor-owned and published** (first-party) or belongs to an app that is **publicly listed in the vendor's marketplace / app gallery**, so the same value appears in every tenant. Anything else fingerprints a single customer. Flag and request changes when an **added or changed** value is:
+  - A tenant/directory, subscription, account, project, organization, or workspace identifier: Entra/M365 tenant IDs (Microsoft's own `f8cdef31-a31e-4b4a-93e4-5f571e91255a` and `72f988bf-86f1-41af-91ab-2d7cd011db47` are the exception), Azure subscription or resource IDs, AWS 12-digit account IDs or account-scoped ARNs, AWS Organization/OU IDs (`o-…`, `ou-…`), GCP project IDs/numbers, Okta org URLs (`<org>.okta.com`), GitHub org/enterprise/repo names, `*.onmicrosoft.com` or other customer domains.
+  - A per-tenant object rather than a global app identifier: Entra service principal **object IDs**, Okta app-instance/user/group IDs (`0oa…`, `00u…`, `00g…`), IAM user/role names, instance/bucket/VPC IDs, customer GCP service accounts (`name@<project>.iam.gserviceaccount.com`), Kubernetes cluster names or workload namespaces/service accounts, mailbox GUIDs, UPNs, device IDs, correlation/request/session IDs.
+  - An application / client ID that the PR has not shown to be first-party or marketplace-listed. Verify per platform:
+    - **Entra ID / Microsoft 365 / Azure** (`azure.signinlogs.properties.app_id` / `resource_id`, `azure.activitylogs.identity.claims.appid`, `azure.graphactivitylogs.properties.app_id`, `o365.audit.ApplicationId` / `ClientAppId`): the app ID must be in [MicrosoftApps.json](https://raw.githubusercontent.com/merill/microsoft-info/main/_info/MicrosoftApps.json) (Microsoft first-party; `AppOwnerOrganizationId` is a Microsoft tenant) or Microsoft Learn's [first-party app list](https://learn.microsoft.com/en-us/troubleshoot/entra/entra-id/governance/verify-first-party-apps-sign-in), or be a multi-tenant app published in the [Microsoft Entra app gallery](https://learn.microsoft.com/en-us/entra/identity/saas-apps/tutorial-list). Prefer an `app_owner_tenant_id` match on Microsoft's tenant over long app ID lists where the logic allows.
+    - **Google Workspace / GCP** (`google_workspace.token.client.id`, `google_workspace.admin.application.name`, `user.email` on `gcp.audit`): OAuth client IDs are `<cloud-project-number>-<client>.apps.googleusercontent.com`. The project number must be a Google-owned project (e.g. `77185425430`, `32555940559`, `764086051850`, `407408718192`, already excluded in-repo) or resolve to a public listing at `https://workspace.google.com/marketplace/app/x/<project-number>` (e.g. `857627895310` resolves to Google's Salesforce Connector add-on) or on Google Cloud Marketplace. Google-managed service agents must wildcard the project number (`service-*@gcp-sa-*.iam.gserviceaccount.com`, `*@cloudbuild.gserviceaccount.com`, `*-compute@developer.gserviceaccount.com`).
+    - **Okta** (`okta.client.id`, `okta.actor.id`, `okta.target.id`): only Okta's own global clients, which use the `okta.<uuid>` form (e.g. `okta.2b1959c8-bcc0-56eb-a589-cfcfb7422f26`, Okta Dashboard — prefer the `okta*` prefix match existing rules use), or [Okta Integration Network](https://www.okta.com/integrations/) apps referenced by display name. Org-specific `0oa…` app-instance IDs are never acceptable.
+    - **AWS** (`aws.cloudtrail.user_identity.arn`, `aws.cloudtrail.user_identity.access_key_id`, `aws.cloudtrail.recipient_account_id`, `cloud.account.id`): only AWS service principals (`*.amazonaws.com`), AWS-managed policy ARNs (`arn:aws:iam::aws:policy/*`), or service-linked / vendor roles with the account wildcarded (`arn:aws:iam::*:role/aws-service-role/*`, `arn:aws:iam::*:role/<VendorDocumentedRole>`) backed by AWS docs or an [AWS Marketplace](https://aws.amazon.com/marketplace) listing. Never access key IDs (`AKIA…` / `ASIA…`), principal IDs (`AIDA…` / `AROA…`), or real account numbers (use `[0-9]{12}` / `*` as existing rules do).
+    - **GitHub** (`github.actor`, `github.org`, `github.repo`, `github.oauth_application_id`): only GitHub-owned actors (`github-actions[bot]`, `dependabot[bot]`) or apps listed on the [GitHub Marketplace](https://github.com/marketplace) by slug; never org, repo, or user handles, or installation IDs lifted from telemetry.
+    - **Kubernetes** (`kubernetes.audit.user.username`, `kubernetes.audit.impersonatedUser.username`, `kubernetes.audit.objectRef.namespace`): only well-known system namespaces and vendor-documented controller identities (`system:serviceaccount:kube-system:*`, AKS/EKS/GKE managed components named in provider docs); never cluster names/UUIDs or customer workload namespaces.
+  - A secret or token in any form — OAuth access/refresh tokens, JWTs (`eyJ…`), Okta API tokens, AWS secret keys, Entra client secrets, SAS signatures (`sig=…`), GitHub PATs (`ghp_…`, `github_pat_…`), Slack tokens (`xox?-…`) — whether in the query, `note`, `setup`, `references`, or sample events pasted into the PR description. Require sample JSON to be redacted (tenant/account/project IDs, principals, IPs, and tokens) before accepting it as evidence.
+  Prefer vendor-documented wildcards, display-name matches, or `new_terms` / baseline logic over hard-coded identifiers. If the only evidence for an identifier is one customer's telemetry, do not approve it.
+- Check exclusions where the drive letter is hardcoded (e.g., `"C:\\Program Files\\*"` should use `"?:\\Program Files\\*"` to cover all drive letters). Applies to **Windows rules only**.
+- Flag unnecessary or overly broad wildcard usage when more specific patterns would work.
+
+</Query — All Languages>
+
+---
+
+### <Query — EQL Specific>
+
+- The **`:` operator** is **case-insensitive** and supports wildcards but can be expensive. Use it only where necessary (e.g., in file paths that could be controlled by an attacker). Use `==` for exact matches.
+- String comparison operators with `~` suffix are **case-insensitive** (e.g., `like~`, `==~`). Without `~`, they are case-sensitive.
+- In EQL, `?` matches any single character and `*` matches zero or more characters in wildcard contexts.
+- Verify all paths include proper escape characters (`\\` for backslashes in Windows paths).
+- Validate regular expressions (prefixed by `regex` or `regex~`).
+- On Linux/macOS, file paths are typically case-sensitive — prefer `==` or `like` over `:` for file path comparisons to avoid the overhead of case-insensitive matching.
+- Sequences with `maxspan > 5m` are generally inefficient unless justified for evasion prevention.
+- For sequences, verify the join keys (`by` clause) are appropriate and indexed fields.
+- Simplify overly complex logic (e.g., a sequence detecting `cmd.exe` spawning `svchost.exe` followed by a network event — the first condition is already sufficiently suspicious).
+- For **LOLBIN detection on Windows**, always include the original file name for resilience: `(process.name : "curl.exe" or process.pe.original_file_name == "curl.exe")` instead of just `process.name : "curl.exe"`.
+- For LOLBIN detection covering multiple related binaries, suggest additions if critical ones are missing (e.g., for `process.name : ("osascript", "python", "perl")`, suggest adding `ruby` and `node`).
+- For network and C2 rules where the scenario does not expect connections to loopback or private IPs, suggest excluding them with `not cidrmatch(destination.ip, "10.0.0.0/8", "127.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")`.
+- `event.type`, `event.action`, and `event.category` should be correct for the event being detected. Commonly:
+  - Process: `event.type == "start"` with `event.action in ("exec", "exec_event", "start")`
+  - File: `event.type in ("creation", "change")` or similar
+  - Network: `event.type == "start"` with `event.category == "network"`
+
+</Query — EQL Specific>
+
+---
+
+### <Query — KQL Specific>
+
+- KQL uses `:` for field matching with wildcard support. Case sensitivity depends on the field mapping — `keyword` fields are case-sensitive, `text` fields with standard analyzers are case-insensitive.
+- Boolean logic uses `and`, `or`, `not` — parentheses must be correct for operator precedence.
+- KQL does not support sequences or joins — if temporal correlation is needed, suggest EQL instead.
+- For complex exclusion logic, consider whether `[[rule.filters]]` would be cleaner than inline `not` clauses.
+
+</Query — KQL Specific>
+
+---
+
+### <Query — ES|QL Specific>
+
+- Validate `EVAL` expressions for correct syntax and type handling.
+- `DISSECT` and `GROK` patterns should be validated for correctness.
+- For aggregate queries using `| stats ... by`, verify the aggregation makes sense for the detection logic and the `by` fields provide meaningful grouping.
+- ES|QL does not support sequences — if temporal correlation is needed, suggest EQL instead.
+- `LIKE` and `RLIKE` are case-sensitive in ES|QL. Use `TO_LOWER()` if case-insensitive matching is needed.
+- `IN` operator is case-sensitive in ES|QL. For case-insensitive list matching, use `TO_LOWER(field) IN ("value1", "value2")`.
+- `MV_*` (multi-value) functions require proper null handling — always check for `IS NOT NULL` before using.
+- Prefer `| keep` with explicit field lists over `| keep *` for clarity and to control which fields appear in alerts.
+- Verify that `FROM` source indices are correct and not overly broad.
+- If the query uses `| COMPLETION`, the rule **must** be tagged `Resources: LLM` (user-visible inference/token-cost label). Flag missing tags, and flag `Resources: LLM` on queries that do not call `COMPLETION`.
+
+</Query — ES|QL Specific>
+
+---
+
+### <Performance>
+
+- Avoid expensive regex on high-volume fields (e.g., `process.command_line regex ".*"` patterns).
+- EQL `:` operator is case-insensitive with wildcard support — it is more expensive than `==` or `like`. Use it judiciously.
+- Lookback windows (`from`) should be as narrow as practical. Wider windows scan more data.
+- Threshold rules with very low `threshold.value` (e.g., 1) are effectively standard query rules with extra overhead — verify this is intentional.
+- New terms rules with very long `history_window_start` values (e.g., 30+ days) increase resource consumption.
+- Threat match rules are inherently expensive — verify `from` and `interval` are appropriate and not running too frequently.
+- For EQL sequences, large `maxspan` values increase memory and compute usage.
+- Aggregate ES|QL queries scanning large time windows should have appropriate filters to reduce the dataset early.
+- Avoid leading wildcards in field comparisons where possible (e.g., `process.name : "*script.exe"` is expensive).
+
+</Performance>
+
+---
+
+### <Suggestions>
+
+Keep suggestions **short and focused** — no need to be verbose.
+*(Maximum 1–2 sentences per suggestion.)*
+
+</Suggestions>

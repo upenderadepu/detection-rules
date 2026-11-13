@@ -5,34 +5,40 @@
 
 import copy
 import json
-import os
 import unittest
+import unittest.mock
+from pathlib import Path
 
 import pytoml
 
 from detection_rules.rule_formatter import nested_normalize, toml_write
 from detection_rules.utils import get_etc_path
 
-tmp_file = 'tmp_file.toml'
+tmp_file = "tmp_file.toml"
 
 
 class TestRuleTomlFormatter(unittest.TestCase):
-    """Test that the cutom toml formatting is not compromising the integrity of the data."""
-    with open(get_etc_path('test_toml.json'), 'r') as f:
-        test_data = json.load(f)
+    """Test that the custom toml formatting is not compromising the integrity of the data."""
+
+    maxDiff = None
+
+    def setUp(self):
+        with get_etc_path(["test_toml.json"]).open() as f:
+            self.test_data = json.load(f)
 
     def compare_formatted(self, data, callback=None, kwargs=None):
         """Compare formatted vs expected."""
+        tmp_path = Path(tmp_file)
         try:
-            toml_write(copy.deepcopy(data), tmp_file)
+            toml_write(copy.deepcopy(data), tmp_path)
 
-            with open(tmp_file, 'r') as f:
-                formatted_contents = pytoml.load(f)
+            formatted_data = tmp_path.read_text()
+            formatted_contents = pytoml.loads(formatted_data)
 
             # callbacks such as nested normalize leave in line breaks, so this must be manually done
-            query = data.get('rule', {}).get('query')
+            query = data.get("rule", {}).get("query")
             if query:
-                data['rule']['query'] = query.strip()
+                data["rule"]["query"] = query.strip()
 
             original = json.dumps(copy.deepcopy(data), sort_keys=True)
 
@@ -41,15 +47,15 @@ class TestRuleTomlFormatter(unittest.TestCase):
                 formatted_contents = callback(formatted_contents, **kwargs)
 
             # callbacks such as nested normalize leave in line breaks, so this must be manually done
-            query = formatted_contents.get('rule', {}).get('query')
+            query = formatted_contents.get("rule", {}).get("query")
             if query:
-                formatted_contents['rule']['query'] = query.strip()
+                formatted_contents["rule"]["query"] = query.strip()
 
             formatted = json.dumps(formatted_contents, sort_keys=True)
-            self.assertEqual(original, formatted, 'Formatting may be modifying contents')
-
+            self.assertEqual(original, formatted, "Formatting may be modifying contents")
         finally:
-            os.remove(tmp_file)
+            if tmp_path.exists():
+                tmp_path.unlink()
 
     def compare_test_data(self, test_dicts, callback=None):
         """Compare test data against expected."""
@@ -67,12 +73,97 @@ class TestRuleTomlFormatter(unittest.TestCase):
     def test_formatter_deep(self):
         """Test that the data remains unchanged from formatting."""
         self.compare_test_data(self.test_data[1:])
-    #
-    # def test_format_of_all_rules(self):
-    #     """Test all rules."""
-    #     rules = rule_loader.load_rules().values()
-    #
-    #     for rule in rules:
-    #         is_eql_rule = isinstance(rule.contents.data, EQLRuleData)
-    #         self.compare_formatted(
-    #             rule.rule_format(formatted_query=False), callback=nested_normalize, kwargs={'eql_rule': is_eql_rule})
+
+    def test_empty_threat_query_always_preserved(self):
+        """Empty threat_query survives export regardless of CUSTOM_RULES_DIR (issue #6283)."""
+        data = {
+            "rule": {
+                "query": "host.name:*",
+                "threat_query": "",
+                "threat_filters": [{"meta": {"negate": False}, "query": {"match_phrase": {"foo": "bar"}}}],
+            }
+        }
+        tmp_path = Path(tmp_file)
+        for custom_rules_dir in ("custom-rules-dir", None):
+            try:
+                with unittest.mock.patch("detection_rules.rule_formatter.CUSTOM_RULES_DIR", custom_rules_dir):
+                    toml_write(copy.deepcopy(data), tmp_path)
+                formatted = pytoml.loads(tmp_path.read_text())
+                self.assertIn("threat_query", formatted["rule"])
+                self.assertEqual(formatted["rule"]["threat_query"], "")
+            finally:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+
+    def test_empty_query_preserved_for_custom_rules(self):
+        """Empty query (filter-only KQL) survives export for custom rules (issue #6167)."""
+        data = {
+            "rule": {
+                "query": "",
+                "filters": [{"meta": {"negate": False}, "query": {"match_phrase": {"foo": "bar"}}}],
+            }
+        }
+        tmp_path = Path(tmp_file)
+        try:
+            with unittest.mock.patch("detection_rules.rule_formatter.CUSTOM_RULES_DIR", "custom-rules-dir"):
+                toml_write(copy.deepcopy(data), tmp_path)
+            formatted = pytoml.loads(tmp_path.read_text())
+            self.assertIn("query", formatted["rule"], "empty query should be preserved for custom rules")
+            self.assertEqual(formatted["rule"]["query"], "")
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink()
+
+    def test_empty_query_dropped_without_custom_rules(self):
+        """Empty query is still omitted outside custom rule exports (prebuilt behavior unchanged)."""
+        data = {
+            "rule": {
+                "query": "",
+                "filters": [{"meta": {"negate": False}, "query": {"match_phrase": {"foo": "bar"}}}],
+            }
+        }
+        tmp_path = Path(tmp_file)
+        try:
+            with unittest.mock.patch("detection_rules.rule_formatter.CUSTOM_RULES_DIR", None):
+                toml_write(copy.deepcopy(data), tmp_path)
+            formatted = pytoml.loads(tmp_path.read_text())
+            self.assertNotIn("query", formatted["rule"])
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink()
+
+    def test_filter_value_does_not_word_wrap(self):
+        """Test long filter values are not split across TOML lines."""
+        filter_value = (
+            r"C:\Program Files\Microsoft Monitoring Agent\Agent\Health Service State\Monitoring Host Temporary "
+            r"Files*\AvailabilityGroupMonitoring.ps1"
+        )
+        data = {
+            "rule": {
+                "filters": [
+                    {
+                        "meta": {"negate": True},
+                        "query": {
+                            "wildcard": {
+                                "file.path": {
+                                    "case_insensitive": True,
+                                    "value": filter_value,
+                                }
+                            }
+                        },
+                    }
+                ]
+            }
+        }
+        tmp_path = Path(tmp_file)
+
+        try:
+            self.compare_formatted(copy.deepcopy(data))
+            toml_write(copy.deepcopy(data), tmp_path)
+            formatted_data = tmp_path.read_text()
+
+            self.assertIn("Monitoring Host Temporary Files*", formatted_data)
+            self.assertNotIn("Monitoring Host Temporary\nFiles*", formatted_data)
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink()

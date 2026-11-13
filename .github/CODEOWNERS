@@ -1,13 +1,21 @@
 # detection-rules code owners
-# POC: Elastic Security Intelligence and Analytics Team
 
-tests/**/*.py     @brokensound77 @rw-access
-detection_rules/  @brokensound77 @rw-access
-tests/            @brokensound77 @rw-access
+## POC: Elastic Threat Research & Detection Engineering
 
-# skip rta-mapping to avoid the spam
-etc/packages.yml  @brokensound77 @rw-access
-etc/*.json        @brokensound77 @rw-access
-etc/*.json        @brokensound77 @rw-access
-etc/*/*           @brokensound77 @rw-access
+tests/**/*.py     @mikaayenson @eric-forte-elastic
+detection_rules/  @mikaayenson @eric-forte-elastic
+tests/            @mikaayenson @eric-forte-elastic
+lib/              @mikaayenson @eric-forte-elastic
+hunting/**/*.py          @mikaayenson @eric-forte-elastic
 
+## skip rta-mapping to avoid the spam
+
+detection_rules/etc/packages.yaml @mikaayenson @eric-forte-elastic
+detection_rules/etc/*.json        @mikaayenson @eric-forte-elastic
+detection_rules/etc/*/*           @mikaayenson @eric-forte-elastic
+detection_rules/etc/version.lock.json @mikaayenson @eric-forte-elastic @shashank-elastic
+detection_rules/etc/deprecated_rules.json @mikaayenson @eric-forte-elastic @shashank-elastic
+
+## exclude files from code owners
+
+detection_rules/etc/non-ecs-schema.json

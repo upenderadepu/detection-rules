@@ -15,6 +15,13 @@
 # VSCode
 /.vscode/
 
+# AI assistants
+/.claude/
+CLAUDE.md
+.cursorrules
+.cursorignore
+.cursor/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -77,7 +84,7 @@ instance/
 .scrapy
 
 # Sphinx documentation
-docs/_build/
+docs-dev/_build/
 
 # PyBuilder
 target/
@@ -107,8 +114,11 @@ ENV/
 /_extras/
 
 # detection rules
+.detection-rules-cfg.*
 releases/
 collections/
 enriched-rule-indexes/
 exports/
+ML-models/
 surveys/
+machine-learning/

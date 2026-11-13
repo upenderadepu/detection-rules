@@ -4,13 +4,12 @@
 # 2.0.
 
 import unittest
-import eql
 
+import eql
 import kql
 
 
 class TestKql2Eql(unittest.TestCase):
-
     def validate(self, kql_source, eql_source, schema=None):
         self.assertEqual(kql.to_eql(kql_source, schema=schema), eql.parse_expression(eql_source))
 
@@ -36,6 +35,10 @@ class TestKql2Eql(unittest.TestCase):
         self.validate("field:value and field2:value2", "field == 'value' and field2 == 'value2'")
 
     def test_nested_query(self):
+        # KQL supports nested queries, but EQL has no nested-field equivalent, so the
+        # parser accepts the query while the EQL conversion is expected to fail.
+        self.assertIsInstance(kql.parse("field:{outer:1 and middle:{inner:2}}"), kql.ast.NestedQuery)
+
         with self.assertRaisesRegex(kql.KqlParseError, "Unable to convert nested query to EQL"):
             kql.to_eql("field:{outer:1 and middle:{inner:2}}")
 
@@ -54,8 +57,13 @@ class TestKql2Eql(unittest.TestCase):
         self.validate("a:(0 or 1 and 2 or (3 and 4))", "a == 0 or a == 1 and a == 2 or (a == 3 and a == 4)")
 
     def test_lone_value(self):
-        for value in ["1", "-1.4", "true", "\"string test\""]:
-            with self.assertRaisesRegex(kql.KqlParseError, "Value not tied to field"):
+        """Free text searches parse as KQL but have no EQL equivalent."""
+        for value in ["1", "-1.4", "true", '"string test"', "*wildcard*", "field:1 and lone"]:
+            # the KQL parses fine (see tests/kuery/test_parser.py) ...
+            self.assertIsNotNone(kql.parse(value))
+
+            # ... but EQL has no way to compare against every field
+            with self.assertRaisesRegex(kql.KqlParseError, "Unable to convert free text search to EQL"):
                 kql.to_eql(value)
 
     def test_schema(self):
@@ -71,14 +79,18 @@ class TestKql2Eql(unittest.TestCase):
         }
 
         self.validate("top.numF : 1", "top.numF == 1", schema=schema)
-        self.validate("top.numF : \"1\"", "top.numF == 1", schema=schema)
+        self.validate('top.numF : "1"', "top.numF == 1", schema=schema)
         self.validate("top.keyword : 1", "top.keyword == '1'", schema=schema)
-        self.validate("top.text : \"hello\"", "top.text == 'hello'", schema=schema)
-        self.validate("top.keyword : \"hello\"", "top.keyword == 'hello'", schema=schema)
-        self.validate("top.text : 1 ", "top.text == '1'", schema=schema)
+        self.validate('top.keyword : "hello"', "top.keyword == 'hello'", schema=schema)
         self.validate("dest:192.168.255.255", "dest == '192.168.255.255'", schema=schema)
         self.validate("dest:192.168.0.0/16", "cidrMatch(dest, '192.168.0.0/16')", schema=schema)
-        self.validate("dest:\"192.168.0.0/16\"", "cidrMatch(dest, '192.168.0.0/16')", schema=schema)
+        self.validate('dest:"192.168.0.0/16"', "cidrMatch(dest, '192.168.0.0/16')", schema=schema)
+
+        with self.assertRaises(eql.EqlSemanticError):
+            self.validate('top.text : "hello"', "top.text == 'hello'", schema=schema)
+
+        with self.assertRaises(eql.EqlSemanticError):
+            self.validate("top.text : 1 ", "top.text == '1'", schema=schema)
 
         with self.assertRaisesRegex(kql.KqlParseError, r"Value doesn't match top.middle's type: nested"):
             kql.to_eql("top.middle : 1", schema=schema)
@@ -89,7 +101,7 @@ class TestKql2Eql(unittest.TestCase):
         with self.assertRaisesRegex(kql.KqlParseError, "Unable to convert nested query to EQL"):
             kql.to_eql("top:{middle:{bool: true}}", schema=schema)
 
-        invalid_ips = ["192.168.0.256", "192.168.0.256/33", "1", "\"1\""]
+        invalid_ips = ["192.168.0.256", "192.168.0.256/33", "1", '"1"']
         for ip in invalid_ips:
             with self.assertRaisesRegex(kql.KqlParseError, r"Value doesn't match dest's type: ip"):
-                kql.to_eql("dest:{ip}".format(ip=ip), schema=schema)
+                kql.to_eql(f"dest:{ip}", schema=schema)

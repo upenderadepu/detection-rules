@@ -8,26 +8,28 @@ These guidelines will also help you post meaningful issues that will be more eas
 
 ## Table of Contents
 
-- [Effective issue creation in Detection Rules](#effective-issue-creation-in-detection-rules)
-  - [Why we create issues before contributing code or new rules](#why-we-create-issues-before-contributing-code-or-new-rules)
-  - [What a good issue looks like](#what-a-good-issue-looks-like)
-  - ["My issue isn’t getting enough attention"](#my-issue-isnt-getting-enough-attention)
-  - ["I want to help!"](#i-want-to-help)
-- [How we use Git and GitHub](#how-we-use-git-and-github)
-  - [Forking](#forking)
-  - [Branching](#branching)
-  - [Commit messages](#commit-messages)
-  - [What goes into a Pull Request](#what-goes-into-a-pull-request)
-- [Our approach to detection engineering](#our-approach-to-detection-engineering)
-  - [Rule metadata](#rule-metadata)
-  - [Using Elastic Common Schema (ECS)](#using-elastic-common-schema-ecs)
-  - [Creating a rule with the CLI](#creating-a-rule-with-the-cli)
-  - [Testing a rule with the CLI](#testing-a-rule-with-the-cli)
-- [Writing style](#writing-style)
-- [Signing the contributor license agreement](#signing-the-contributor-license-agreement)
-- [Submitting a Pull Request](#submitting-a-pull-request)
-  - [What to expect from a code review](#what-to-expect-from-a-code-review)
-  - [How we handle merges](#how-we-handle-merges)
+- [Contributing to Detection Rules](#contributing-to-detection-rules)
+  - [Table of Contents](#table-of-contents)
+  - [Effective issue creation in Detection Rules](#effective-issue-creation-in-detection-rules)
+    - [Why we create issues before contributing code or new rules](#why-we-create-issues-before-contributing-code-or-new-rules)
+    - [What a good issue looks like](#what-a-good-issue-looks-like)
+    - ["My issue isn't getting enough attention"](#my-issue-isnt-getting-enough-attention)
+    - ["I want to help!"](#i-want-to-help)
+  - [How we use Git and GitHub](#how-we-use-git-and-github)
+    - [Forking](#forking)
+    - [Branching](#branching)
+    - [Commit messages](#commit-messages)
+    - [What goes into a Pull Request](#what-goes-into-a-pull-request)
+  - [Our approach to detection engineering](#our-approach-to-detection-engineering)
+    - [Rule metadata](#rule-metadata)
+    - [Using Elastic Common Schema (ECS)](#using-elastic-common-schema-ecs)
+    - [Creating a rule with the CLI](#creating-a-rule-with-the-cli)
+    - [Testing a rule with the CLI](#testing-a-rule-with-the-cli)
+  - [Writing style](#writing-style)
+  - [Signing the contributor license agreement](#signing-the-contributor-license-agreement)
+  - [Submitting a Pull Request](#submitting-a-pull-request)
+    - [What to expect from a code review](#what-to-expect-from-a-code-review)
+    - [How we handle merges](#how-we-handle-merges)
 
 
 ## Effective issue creation in Detection Rules
@@ -60,9 +62,15 @@ When requesting a **New rule**, please create an issue of the **New rule** type.
 
 First of all, **sorry about that!** We want you to have a great time with Detection Rules.
 
-We'll tag issues and pull requests with the target release. If a rule is blocked by a feature, we'll add a label to reflect that. With all of the issues, we need to prioritize according to impact and difficulty, so some issues can be neglected while we work on more pressing issues.
+We'll tag issues and pull requests with the target release if applicable. If a rule is blocked by a feature, we'll add a label to reflect that. With all of the issues, we need to prioritize according to impact and difficulty, so some issues can be neglected while we work on more pressing issues.
 
 Of course, feel free to bump your issues if you think they've been neglected for a prolonged period.
+
+Issues and pull requests will be marked as `stale` after 60 days of inactivity. After 7 more days of inactivity, they will be closed automatically.
+
+If an issue or pull request is marked `stale` and/or closed, this does not mean it is not important, just that there may be more work than available resources over a given time. We feel that it is a better experience to generate activity responding to a stale issue or letting it close, than to let something remain open and neglected for longer periods of time.
+
+If your issue or pull request is closed from inactivity and you feel this is an error, please feel free to re-open it with comments and we will try our best to respond with justification to close or to get it the proper attention.
 
 ### "I want to help!"
 
@@ -83,7 +91,20 @@ We follow the [GitHub forking model](https://help.github.com/articles/fork-a-rep
 
 This repository follows a similar approach to other repositories within the [Elastic](https://github.com/elastic) organization, with a few exceptions that make our life easier. One way this repository is simpler is the lack of major version breaking changes. This means we have less backport commits to worry about and makes us a little more productive.
 
-The basic branching workflow we follow for Detection Rules:
+**7.13 and later**
+
+The branching workflow we currently follow for Detection Rules:
+
+* All changes for the next release of rules are made to the `main` branch
+* During feature freeze for a release, we will create a branch from `main` for the release version `{majorVersion.minorVersion}`. This means that we can continue contributing to `main`, even during feature freeze, and it will target `{majorVersion.minorVersion+1}`
+* Rules are automatically backported to old branches (starting at `7.13`) if the `backport: auto` label is set on GitHub. This is done automatically for all PRs that merge to main `main` with the label `backport: auto`.
+* To opt-out of a backport, add the label `backport: skip`. GitHub will automatically remove the `backport: auto` label from the PR when this label is set
+* From 7.13 to 8.1, you can use Fleet to [download prebuilt rules](https://www.elastic.co/guide/en/security/current/rules-ui-management.html#download-prebuilt-rules) for your stack, and subsequent releases will follow the instructions at [Update prebuilt rules](https://www.elastic.co/guide/en/security/current/rules-ui-management.html#update-prebuilt-rules)
+* Changes to rules in an already-released branch will be included in an update to the "Prebuilt Security Detection Rules" integration
+
+**Prior to 7.13**
+
+The branching workflow we used to follow for Detection Rules:
 
 * All changes for the next release of rules are made to the `main` branch
 * During feature freeze for a release, we will create a branch from `main` for the release version `{majorVersion.minorVersion}`. This means that we can continue contributing to `main`, even during feature freeze, and it will just target `{majorVersion.minorVersion+1}`
@@ -136,7 +157,7 @@ Some of the required metadata captured in a rule file:
 | **risk_score**       |          | Integer to rank the risk relative to other rules. Leave blank if unknown        |
 | **rule_id**          |     ✓    | Automatically generated UUID for the rule                                       |
 | **severity**         |     ✓    | Severity of the matching results (e.g., `low`, `medium`, `high`, `critical`)     |
-| **tags**             |          | Array of tags for grouping the rule (e.g., `APM`, `Linux`, `Packetbeat`, ...)    |
+| **tags**             |          | Array of `Category: Value` tags. See `docs-dev/rule-tag-taxonomy.md`. Rules whose query uses ES\|QL `COMPLETION` **must** include `Resources: LLM` so users can identify LLM-backed detections. |
 | **threat**           |     ✓    | Mapping to a threat framework, such as MITRE ATT&CK®                            |
 | **to**               |          | Relative end time of a rule (e.g. `now`)                                        |
 | **type**             |     ✓    | Execution type of the rule (`query` or `machine_learning`)                      |
@@ -148,7 +169,7 @@ Our rules should be written generically when possible. We use [Elastic Common Sc
 
 If the relevant [categorization values](https://www.elastic.co/guide/en/ecs/current/ecs-category-field-values-reference.html) are already defined for ECS, we use these to narrow down the event type before adding the query. Typically, the query starts with the broadest grouping possible and gets narrower for each clause. For example, we might write `event.category:process and event.type:start and process.name:net.exe and process.args:group`. First, we match process events with `event.category`, then narrow to creation events with `event.type`. Of the process creation events, we're looking for the process `net.exe` with `process.name` and finally we check the arguments `group` by looking at `process.args`. This flow has little effect on the generated Elasticsearch query, but is the most intuitive to read for rule developers.
 
-Sometimes, it might not make sense for ECS to standardize a field, value, or category. Occasionally, we may encounter fields that specific to a single use-case or vendor. When that happens, we add an exception in [etc/non-ecs-schema.json](etc/non-ecs-schema.json). We automatically detect beats by looking at the index patterns used in a rule. If we see `winlogbeat-*`, for example, then we can validate the rule against ECS + Winlogbeat. When using a particular beat, please use `event.module` and `event.dataset` to make the rule more precise and to better nudge the validation logic. Similar to our logic flow for ECS categorization, we recommend searches progress from `event.module` → `event.dataset` → `event.action` → `<additional criteria>`.
+Sometimes, it might not make sense for ECS to standardize a field, value, or category. Occasionally, we may encounter fields that specific to a single use-case or vendor. When that happens, we add an exception in [detection_rules/etc/non-ecs-schema.json](detection_rules/etc/non-ecs-schema.json). A sibling file, [detection_rules/etc/integration-emitted-ecs-schema.json](detection_rules/etc/integration-emitted-ecs-schema.json), covers ECS fields an integration populates without declaring them: when a rule is validated against an integration package (by its `data_stream.dataset` or the `integration` metadata), only the fields the package's field files declare (plus the fields Elastic Agent adds to every document) are accepted, not the full ECS schema. An ECS field the integration genuinely populates but does not declare is added under the rule's index pattern in integration-emitted-ecs-schema.json, while fields that are not part of ECS at all stay in non-ecs-schema.json (as does an ECS field whose type in the index deliberately differs from its ECS definition). Both files are loaded together and serve the same role in validation; they are separate only to keep the two kinds of exceptions easy to track. We automatically detect beats by looking at the index patterns used in a rule. If we see `winlogbeat-*`, for example, then we can validate the rule against ECS + Winlogbeat. When using a particular beat, please use `event.module` and `data_stream.dataset` to make the rule more precise and to better nudge the validation logic. Similar to our logic flow for ECS categorization, we recommend searches progress from `event.module` → `data_stream.dataset` → `event.action` → `<additional criteria>`.
 
 When a Pull Request is missing a necessary ECS change, please add an issue to [elastic/ecs](https://github.com/elastic/ecs) and link it from the pull request. We don't want to leave PRs blocked for too long, so if the ECS issue isn't progressing, then we can add a note and use the vendor- or beat-specific fields. We'll create another issue, reminding us to update the rule logic to switch to the ECS field when it becomes available. To maximize compatibility, we may add an `or` clause for a release or two to handle the different permutatations. After a few releases, we'll remove this and strictly require the ECS fields.
 
@@ -183,7 +204,7 @@ references (multi, comma separated):
 risk_score [21] ("n/a" to leave blank)  (required):
 rule_id [90d0c543-e197-46d8-934d-0320b2c83486] ("n/a" to leave blank)  (required):
 severity [low] ("n/a" to leave blank)  (required): medium
-tags (multi, comma separated): Windows  
+tags (multi, comma separated): Windows
 throttle:
 timeline_id:
 timeline_title:

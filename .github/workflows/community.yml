@@ -1,0 +1,66 @@
+name: Community
+
+on:
+  pull_request_target:
+    types:
+      - opened
+  issues:
+    types:
+      - opened
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+  id-token: write
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch ephemeral GitHub token
+        id: fetch-ephemeral-token
+        uses: elastic/ci-gh-actions/fetch-github-token@f1837d5894f688eb909c1d777aaaf2f1df705cef # v1.5.4
+        with:
+          vault-instance: "ci-prod"
+          vault-role: "token-policy-6a609e518e74"
+
+      - name: Check if member of elastic org
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        id: membership
+        with:
+          github-token: ${{ steps.fetch-ephemeral-token.outputs.token }}
+          result-encoding: string
+          script: |
+
+            try {
+              const result = await github.rest.orgs.getMembershipForUser({
+                       org: "elastic",
+                       username: '${{ github.actor }}'
+                    })
+
+              console.log(result?.data?.state)
+              if (result?.data?.state == "active"){
+                console.log("%s: detected as an active member of elastic org", '${{ github.actor }}')
+                return "member";
+              } else {
+                console.log("%s: not detected as active member of elastic org", '${{ github.actor }}')
+                return "notMember";
+              }
+
+            } catch (error) {
+              return "notMember";
+            }
+
+
+      - name: Add label for community members
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        if: ${{ steps.membership.outputs.result == 'notMember' }}
+        with:
+          script: |
+            github.rest.issues.addLabels({
+                            issue_number: context.issue.number,
+                            owner: context.repo.owner,
+                            repo: context.repo.repo,
+                            labels: ['community']
+                          })

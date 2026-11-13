@@ -4,21 +4,21 @@
 # 2.0.
 
 import unittest
+
 import kql
 
 
 class LintTests(unittest.TestCase):
-
     def validate(self, source, linted, *args):
         self.assertEqual(kql.lint(source), linted, *args)
 
     def test_lint_field(self):
         self.validate("a : b", "a:b")
-        self.validate("\"a\": b", "a:b")
-        self.validate("a : \"b\"", "a:b")
+        self.validate('"a": b', "a:b")
+        self.validate('a : "b"', "a:b")
         self.validate("a : (b)", "a:b")
         self.validate("a:1.234", "a:1.234")
-        self.validate("a:\"1.234\"", "a:1.234")
+        self.validate('a:"1.234"', "a:1.234")
 
     def test_upper_tokens(self):
         queries = [
@@ -33,6 +33,12 @@ class LintTests(unittest.TestCase):
         for q in queries:
             with self.assertRaises(kql.KqlParseError):
                 kql.parse(q)
+
+        for q in queries:
+            # Test query successfully converts and parses
+            parsed_query = kql.parse(q, normalize_kql_keywords=True)
+            # Test that the parsed query is not equal to the original query, that the transformation was applied
+            self.assertNotEqual(str(parsed_query), q, f"Parsed query {parsed_query} matches the original {q}")
 
     def test_lint_precedence(self):
         self.validate("a:b or (c:d and e:f)", "a:b or c:d and e:f")
@@ -73,8 +79,18 @@ class LintTests(unittest.TestCase):
         self.validate("not (not (a:b or c:d))", "a:b or c:d")
         self.validate("not (not (a:(not b) or c:(not d)))", "not a:b or not c:d")
 
+    def test_free_text(self):
+        self.validate('"Accepted password for root"', '"Accepted password for root"')
+        self.validate("agent12", "agent12")
+        self.validate("*password*", "*password*")
+        self.validate("*", "*")
+        self.validate(
+            'process.name : agent12 and "Accepted password for root"',
+            'process.name:agent12 and "Accepted password for root"',
+        )
+
     def test_ip(self):
-        self.validate("a:ff02\\:\\:fb", "a:\"ff02::fb\"")
+        self.validate("a:ff02\\:\\:fb", 'a:"ff02::fb"')
 
     def test_compound(self):
         self.validate("a:1 and b:2 and not (c:3 or c:4)", "a:1 and b:2 and not c:(3 or 4)")

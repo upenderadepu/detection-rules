@@ -6,42 +6,61 @@
 """Definitions for packages destined for the registry."""
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Type
 
-from marshmallow import Schema, validate
-from marshmallow_dataclass import class_schema
-
-from .definitions import ConditionSemVer, SemVer
+from detection_rules.mixins import MarshmallowDataclassMixin
+from detection_rules.schemas.definitions import ConditionSemVer, SemVer
 
 
 @dataclass
-class RegistryPackageManifest:
+class ConditionElastic:
+    subscription: str
+    capabilities: list[str] | None
+
+
+@dataclass
+class Condition:
+    kibana_version: str = field(metadata={"data_key": "kibana.version"})
+    elastic: ConditionElastic
+
+
+@dataclass
+class Icon:
+    size: str
+    src: str
+    type: str
+
+
+@dataclass
+class RegistryPackageManifestBase(MarshmallowDataclassMixin):
     """Base class for registry packages."""
 
-    conditions: Dict[str, ConditionSemVer]
+    categories: list[str]
+    description: str
+    format_version: SemVer
+    icons: list[Icon]
+    name: str
+    owner: dict[str, str]
+    title: str
+    type: str
     version: SemVer
 
-    categories: List[str] = field(default_factory=lambda: ['security'])
-    description: str = 'Rules for the detection engine in the Security application.'
-    format_version: SemVer = field(metadata=dict(validate=validate.Equal('1.0.0')), default='1.0.0')
-    icons: list = field(default_factory=list)
-    internal: bool = True
-    license: str = 'basic'
-    name: str = 'detection_rules'
-    owner: Dict[str, str] = field(default_factory=lambda: dict(github='elastic/protections'))
-    policy_templates: list = field(default_factory=list)
-    release: str = 'experimental'
-    screenshots: list = field(default_factory=list)
-    title: str = 'Detection rules'
-    type: str = 'integration'
+    internal: bool | None
+    policy_templates: list[str] | None
+    screenshots: list[str] | None
 
-    @classmethod
-    def get_schema(cls) -> Type[Schema]:
-        return class_schema(cls)
 
-    @classmethod
-    def from_dict(cls, obj: dict) -> 'RegistryPackageManifest':
-        return cls.get_schema()().load(obj)
+@dataclass
+class RegistryPackageManifestV1(RegistryPackageManifestBase):
+    """Registry packages using elastic-package v1."""
 
-    def asdict(self) -> dict:
-        return self.get_schema()().dump(self)
+    conditions: dict[str, ConditionSemVer]
+    license: str
+    release: str
+
+
+@dataclass
+class RegistryPackageManifestV3(RegistryPackageManifestBase):
+    """Registry packages using elastic-package v3."""
+
+    conditions: Condition
+    source: dict[str, str]

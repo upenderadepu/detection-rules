@@ -1,0 +1,47 @@
+name: List Target Branches
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: "Git ref to read target-branches from (use main for PR gates)"
+        type: string
+        required: false
+        default: ""
+    # Map the workflow outputs to job outputs
+    outputs:
+      branches:
+        description: "List of target branches"
+        value: ${{ jobs.list-target-branches.outputs.matrix }}
+
+permissions:
+  contents: read
+
+jobs:
+  list-target-branches:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      matrix: ${{ steps.get-branch-list.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # Default checkout is the caller SHA; PR gates must pin main so a PR cannot
+          # shrink the target list by editing stack-schema-map / this workflow.
+          ref: ${{ inputs.ref != '' && inputs.ref || github.sha }}
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.14'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip cache purge
+          pip install .[dev]
+
+      - id: get-branch-list
+        run: |
+          python -m detection_rules dev utils get-branches
+          echo "matrix=$(cat ./detection_rules/etc/target-branches.yaml)" >> "$GITHUB_OUTPUT"

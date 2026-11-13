@@ -1,0 +1,810 @@
+# Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+# or more contributor license agreements. Licensed under the Elastic License
+# 2.0; you may not use this file except in compliance with the Elastic License
+# 2.0.
+
+"""Functions to support and interact with Kibana integrations."""
+
+import fnmatch
+import functools
+import gzip
+import json
+import zipfile
+from collections import defaultdict
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+import kql  # type: ignore[reportMissingTypeStubs]
+import requests
+import yaml
+from marshmallow import EXCLUDE, Schema, fields, post_load
+from semver import Version
+
+from . import ecs
+from .beats import flatten_ecs_schema
+from .config import load_current_package_version
+from .schemas import definitions
+from .utils import cached, clear_caches, get_etc_path, read_gzip, unzip
+
+if TYPE_CHECKING:
+    from .rule import QueryRuleData, RuleMeta
+
+
+MANIFEST_FILE_PATH = get_etc_path(["integration-manifests.json.gz"])
+DEFAULT_MAX_RULE_VERSIONS = 1
+SCHEMA_FILE_PATH = get_etc_path(["integration-schemas.json.gz"])
+ROUTING_RULES_FILE_PATH = get_etc_path(["integration-routing-rules.json.gz"])
+
+
+_notified_integrations: set[str] = set()
+
+
+# These loaders feed derived caches; use clear_caches(), not loader.clear(), to invalidate them.
+@cached
+def load_integrations_manifests() -> dict[str, Any]:
+    """Load the consolidated integrations manifest."""
+    return json.loads(read_gzip(get_etc_path(["integration-manifests.json.gz"])))
+
+
+@cached
+def load_integrations_schemas() -> dict[str, Any]:
+    """Load the consolidated integrations schemas."""
+    return json.loads(read_gzip(get_etc_path(["integration-schemas.json.gz"])))
+
+
+@cached
+def load_integrations_routing_rules() -> dict[str, Any]:
+    """Load the consolidated routing rules: package -> version -> source data stream -> target data streams."""
+    if not ROUTING_RULES_FILE_PATH.exists():
+        return {}
+    return json.loads(read_gzip(ROUTING_RULES_FILE_PATH))
+
+
+class IntegrationManifestSchema(Schema):
+    name = fields.Str(required=True)
+    version = fields.Str(required=True)
+    release = fields.Str(required=True)
+    description = fields.Str(required=True)
+    download = fields.Str(required=True)
+    conditions = fields.Dict(required=True)
+    policy_templates = fields.List(fields.Dict)
+    owner = fields.Dict(required=False)
+
+    @post_load
+    def transform_policy_template(self, data: dict[str, Any], **_: Any) -> dict[str, Any]:
+        if "policy_templates" in data:
+            policy_templates = data["policy_templates"]
+            data["policy_templates"] = [policy["name"] for policy in policy_templates]
+            # Keep the data streams of each policy template: a data stream that is not named after its policy
+            # template (e.g. azure.signinlogs under adlogs) can only be resolved to its policy template this way.
+            data_streams = {
+                policy["name"]: policy["data_streams"] for policy in policy_templates if policy.get("data_streams")
+            }
+            if data_streams:
+                data["policy_template_data_streams"] = data_streams
+        return data
+
+
+def get_policy_template_for_data_stream(manifest: dict[str, Any], data_stream: str) -> str | None:
+    """Return the policy template of a package version manifest that collects the data stream."""
+    if data_stream in manifest.get("policy_templates", []):
+        return data_stream
+    for policy_template, data_streams in manifest.get("policy_template_data_streams", {}).items():
+        if data_stream in data_streams:
+            return policy_template
+    return None
+
+
+def build_integrations_manifest(
+    overwrite: bool,
+    rule_integrations: list[str] = [],  # noqa: B006
+    integration: str | None = None,
+    prerelease: bool = False,
+) -> None:
+    """Builds a new local copy of manifest.yaml from integrations Github."""
+
+    def write_manifests(integrations: dict[str, Any]) -> None:
+        manifest_file_bytes = json.dumps(integrations).encode("utf-8")
+        with gzip.open(MANIFEST_FILE_PATH, "wb") as f:
+            _ = f.write(manifest_file_bytes)
+
+    if overwrite and MANIFEST_FILE_PATH.exists():
+        MANIFEST_FILE_PATH.unlink()
+
+    final_integration_manifests: dict[str, dict[str, Any]] = {}
+    if rule_integrations:
+        final_integration_manifests = {integration: {} for integration in rule_integrations}
+    elif integration:
+        final_integration_manifests = {integration: {}}
+        rule_integrations = [integration]
+
+    for _integration in rule_integrations:
+        integration_manifests = get_integration_manifests(_integration, prerelease=prerelease)
+        for manifest in integration_manifests:
+            validated_manifest = IntegrationManifestSchema(unknown=EXCLUDE).load(manifest)  # type: ignore[reportUnknownVariableType]
+            package_version = validated_manifest.pop("version")  # type: ignore[reportOptionalMemberAccess]
+            final_integration_manifests[_integration][package_version] = validated_manifest
+
+    if overwrite and rule_integrations:
+        write_manifests(final_integration_manifests)
+    elif integration and not overwrite:
+        with gzip.open(MANIFEST_FILE_PATH, "rb") as manifest_file:
+            manifest_file_bytes = manifest_file.read()
+
+        manifest_file_contents = json.loads(manifest_file_bytes.decode("utf-8"))
+        manifest_file_contents[integration] = final_integration_manifests[integration]
+        write_manifests(manifest_file_contents)
+
+    clear_caches()
+    print(f"final integrations manifests dumped: {MANIFEST_FILE_PATH}")
+
+
+# Fields Elastic Agent adds to every document it ships, independent of the package, which package field files
+# rarely declare: the ECS agent, cloud and host field sets (host and cloud come from the add_host_metadata and
+# add_cloud_metadata processors Fleet enables by default), the data_stream constant keywords, and the two fields
+# stamped by Fleet's final ingest pipeline.
+ELASTIC_AGENT_FIELDSETS = ("agent", "cloud", "host")
+ELASTIC_AGENT_FIELDS = (
+    "data_stream.dataset",
+    "data_stream.namespace",
+    "data_stream.type",
+    "event.agent_id_status",
+    "event.ingested",
+)
+
+
+@cached
+def elastic_agent_fields() -> dict[str, str]:
+    """Fields Elastic Agent adds to every document it ships, mapped to their ECS types."""
+    ecs_flat: dict[str, Any] = ecs.get_schema(ecs.get_max_version(), name="ecs_flat")
+    selected = {name: ecs_flat[name] for name in ELASTIC_AGENT_FIELDS}
+    for name, info in ecs_flat.items():
+        fieldset, _, subpath = name.partition(".")
+        # skip the field sets ECS re-nests under host and cloud (host.geo.*, host.risk.*, *.entity.*) and the
+        # origin/target self-nestings, which no shipper populates
+        if (
+            fieldset in ELASTIC_AGENT_FIELDSETS
+            and info.get("original_fieldset") in (None, "os")
+            and not subpath.startswith(("origin.", "target."))
+        ):
+            selected[name] = info
+    return ecs.flatten_multi_fields(selected)
+
+
+def parse_version_schema(zip_ref: zipfile.ZipFile, package: str) -> dict[str, Any]:
+    """Parse the field files of an EPR package zip into a single version schema."""
+    version_schema: dict[str, Any] = {}
+
+    for file in zip_ref.namelist():
+        file_data_bytes = zip_ref.read(file)
+        # Check if the file is a match
+        if fnmatch.fnmatch(file, "*/fields/*.yml"):
+            integration_name = Path(file).parent.parent.name
+            # every data stream carries the Elastic Agent fields on top of what its field files declare
+            stream_schema: dict[str, str] = version_schema.setdefault(integration_name, dict(elastic_agent_fields()))
+            for field in flatten_ecs_schema(yaml.safe_load(file_data_bytes)):
+                stream_schema[field["name"]] = field["type"]
+                # Built packages resolve `external: ecs` references into explicit multi_fields (e.g. process.name
+                # -> a `text` variant), so a data stream that maps a field also maps its multi-field variants.
+                multi_fields: list[dict[str, Any]] = field.get("multi_fields") or []
+                for subfield in multi_fields:
+                    stream_schema[f"{field['name']}.{subfield['name']}"] = subfield.get("type", "keyword")
+
+        # add machine learning jobs to the schema
+        if package in [str.lower(x) for x in definitions.MACHINE_LEARNING_PACKAGES] and fnmatch.fnmatch(
+            file, "*/ml_module/*ml.json"
+        ):
+            ml_module = json.loads(file_data_bytes)
+            job_ids = [job["id"] for job in ml_module["attributes"]["jobs"]]
+            version_schema["jobs"] = job_ids
+
+        del file_data_bytes
+
+    return version_schema
+
+
+def parse_version_routing_rules(zip_ref: zipfile.ZipFile, package: str) -> dict[str, list[str]]:
+    """Parse the routing rules of an integrations package zip into source data stream -> rerouted data streams."""
+    prefix = f"{package}."
+    routing: dict[str, list[str]] = {}
+    for file in zip_ref.namelist():
+        if not fnmatch.fnmatch(file, "*/data_stream/*/routing_rules.yml"):
+            continue
+        source = Path(file).parent.name
+        targets: set[str] = set()
+        entries: list[dict[str, Any]] = yaml.safe_load(zip_ref.read(file)) or []
+        for entry in entries:
+            rules: list[dict[str, Any]] = entry.get("rules") or []
+            for rule in rules:
+                target_datasets: str | list[Any] | None = rule.get("target_dataset")
+                if isinstance(target_datasets, str):
+                    target_datasets = [target_datasets]
+                for target in target_datasets or []:
+                    # A templated target ({{...}}) is resolved per document, and a data stream of another package is
+                    # filled through that package's own policy templates, so keep only literal same-package targets.
+                    if isinstance(target, str) and target.startswith(prefix) and "{{" not in target:
+                        targets.add(target.removeprefix(prefix))
+        targets.discard(source)
+        if targets:
+            routing[source] = sorted(targets)
+    return routing
+
+
+def build_integrations_schemas(overwrite: bool, integration: str | None = None) -> None:
+    """Builds a new local copy of integration-schemas.json.gz from EPR integrations."""
+
+    # Check if the file already exists and handle accordingly
+    if overwrite and SCHEMA_FILE_PATH.exists():
+        SCHEMA_FILE_PATH.unlink()
+        final_integration_schemas = {}
+    elif SCHEMA_FILE_PATH.exists():
+        final_integration_schemas = load_integrations_schemas()
+    else:
+        final_integration_schemas = {}
+
+    # The routing rules come from the same package zips but live in their own file, so that no consumer of the
+    # schemas (keyed by data stream) can read them as a data stream. A version is recorded even without routing
+    # rules, which marks it as parsed. A full build only parses the zips it downloads for new schemas; a single
+    # integration build also downloads the versions of that integration that have no routing rules recorded yet.
+    if overwrite and ROUTING_RULES_FILE_PATH.exists():
+        ROUTING_RULES_FILE_PATH.unlink()
+    final_routing_rules: dict[str, Any] = load_integrations_routing_rules() if not overwrite else {}
+
+    # Load the integration manifests
+    integration_manifests = load_integrations_manifests()
+
+    # if a single integration is specified, only process that integration
+    if integration:
+        if integration in integration_manifests:
+            integration_manifests = {integration: integration_manifests[integration]}
+        else:
+            raise ValueError(f"Integration {integration} not found in manifest.")
+
+    # Loop through the packages and versions
+    for package, versions in integration_manifests.items():
+        print(f"processing {package}")
+        package_schemas = final_integration_schemas.setdefault(package, {})  # type: ignore[reportUnknownMemberType]
+        package_routing_rules = final_routing_rules.setdefault(package, {})
+        for version, manifest in versions.items():
+            if version in package_schemas and (version in package_routing_rules or not integration):
+                continue
+
+            # Download the zip file
+            download_url = f"https://epr.elastic.co{manifest['download']}"
+            response = requests.get(download_url, timeout=30)
+            response.raise_for_status()
+
+            # Open the zip file
+            with unzip(response.content) as zip_ref:
+                if version not in package_schemas:
+                    package_schemas[version] = parse_version_schema(zip_ref, package)
+                package_routing_rules[version] = parse_version_routing_rules(zip_ref, package)
+
+    # Write the final integration schemas and routing rules to disk
+    with gzip.open(SCHEMA_FILE_PATH, "w") as schema_file:
+        schema_file_bytes = json.dumps(final_integration_schemas).encode("utf-8")
+        _ = schema_file.write(schema_file_bytes)
+    with gzip.open(ROUTING_RULES_FILE_PATH, "w") as routing_rules_file:
+        _ = routing_rules_file.write(json.dumps(final_routing_rules, sort_keys=True).encode("utf-8"))
+
+    clear_caches()
+    print(f"final integrations manifests dumped: {SCHEMA_FILE_PATH}")
+
+
+def _parse_clause(clause: str) -> tuple[Version, Version | None]:
+    """Parse a single AND'd clause of npm-style range tokens into [lo, hi) bounds.
+
+    hi is None when the clause has no upper bound. Supports the subset of
+    npm semver currently emitted by EPR conditions.kibana.version strings:
+    ^X.Y.Z, ~X.Y.Z, >=X.Y.Z, >X.Y.Z, <=X.Y.Z, <X.Y.Z,
+    =X.Y.Z, and bare X.Y.Z. Unsupported tokens raise ValueError so
+    we fail loudly if EPR's grammar grows.
+    """
+    lo = Version(0, 0, 0)
+    hi: Version | None = None
+
+    def tighten_hi(current: Version | None, candidate: Version) -> Version:
+        return candidate if current is None else min(current, candidate)
+
+    for token in clause.strip().split():
+        if not token:
+            continue
+        if token.startswith("^"):
+            base = Version.parse(token[1:])
+            if base.major == 0:
+                raise ValueError(f"caret on 0.x kibana version is unsupported: {token!r}")
+            lo = max(lo, base)
+            hi = tighten_hi(hi, Version(base.major + 1, 0, 0))
+        elif token.startswith("~"):
+            base = Version.parse(token[1:])
+            lo = max(lo, base)
+            hi = tighten_hi(hi, Version(base.major, base.minor + 1, 0))
+        elif token.startswith(">="):
+            lo = max(lo, Version.parse(token[2:]))
+        elif token.startswith("<="):
+            hi = tighten_hi(hi, Version.parse(token[2:]).bump_patch())
+        elif token.startswith(">"):
+            lo = max(lo, Version.parse(token[1:]).bump_patch())
+        elif token.startswith("<"):
+            hi = tighten_hi(hi, Version.parse(token[1:]))
+        elif token.startswith("="):
+            exact = Version.parse(token[1:])
+            lo = max(lo, exact)
+            hi = tighten_hi(hi, exact.bump_patch())
+        elif token[0].isdigit():
+            exact = Version.parse(token)
+            lo = max(lo, exact)
+            hi = tighten_hi(hi, exact.bump_patch())
+        else:
+            raise ValueError(f"unsupported kibana version token: {token!r}")
+    return lo, hi
+
+
+@functools.cache
+def _parse_kibana_range(version_requirement: str) -> list[tuple[Version, Version | None]]:
+    """Parse an EPR conditions.kibana.version string into a list of [lo, hi) clauses."""
+    # clauses separated by || are OR'd; whitespace-separated tokens within a clause are AND'd
+    # this pure string-to-bounds cache intentionally does not participate in clear_caches()
+    # cached: the returned list is shared, so callers must treat it as read-only
+    return [_parse_clause(c) for c in version_requirement.split("||")]
+
+
+def _satisfies_kibana_range(stack: Version, version_requirement: str) -> bool:
+    """Return True iff stack satisfies the EPR conditions.kibana.version string."""
+    return any(lo <= stack and (hi is None or stack < hi) for lo, hi in _parse_kibana_range(version_requirement))
+
+
+def find_latest_integration_patch_for_minor(packages: Iterable[str], major: int, minor: int) -> int:
+    """Find the latest stack patch integration packages need for a major.minor."""
+    # freeze() does not handle sets, so normalize to a hashable frozenset before memoizing
+    return _latest_patch_for_minor(frozenset(packages), major, minor)
+
+
+@cached
+def _latest_patch_for_minor(packages: frozenset[str], major: int, minor: int) -> int:
+    """Memoized body of `find_latest_integration_patch_for_minor` against the bundled manifests."""
+    # stack-schema-map keys stacks at MAJOR.MINOR.0, but an integration may gate its latest
+    # package (and newly-added data streams) behind a later patch (e.g. azure ~8.19.10).
+    # Resolving against the literal .0 falls back to an older package that predates the
+    # stream. Return the latest patch a package gates on for the minor.
+    #
+    # Track the *newest* package version's floor (not the max floor across all versions):
+    # Fleet always installs the latest compatible package, so that floor is the patch a
+    # stack actually needs. A newer package occasionally lowers its floor (e.g. apm 7.16.1
+    # gates ^7.16.1 but the newer 7.16.2 gates ^7.16.0); honoring the newest version
+    # matches what Fleet installs rather than an older, higher floor.
+    manifests = load_integrations_manifests()
+    latest_patch = 0
+    for package in packages:
+        latest_package_version: Version | None = None
+        latest_package_patch = 0
+        for package_version, manifest in manifests.get(package, {}).items():
+            version_requirement = manifest.get("conditions", {}).get("kibana", {}).get("version")
+            if not version_requirement:
+                continue
+            try:
+                clauses = _parse_kibana_range(version_requirement)
+            except ValueError:
+                # Skip manifests whose kibana condition uses tokens we cannot parse.
+                continue
+            floors = [lo.patch for lo, _ in clauses if lo.major == major and lo.minor == minor]
+            if not floors:
+                continue
+            parsed_package_version = Version.parse(package_version)
+            if latest_package_version is None or parsed_package_version > latest_package_version:
+                latest_package_version = parsed_package_version
+                latest_package_patch = max(floors)
+        latest_patch = max(latest_patch, latest_package_patch)
+    return latest_patch
+
+
+# Sentinel written by parse_datasets when a rule indexes a package but not a data stream.
+UNKNOWN_PACKAGE_INTEGRATION = "Unknown"
+# Stack versions at/above this use >= for related_integrations.version (caret below).
+RELATED_INTEGRATION_GTE_OPERATOR_MIN_STACK = Version(9, 5, 0)
+
+
+def _package_version_has_integration(
+    version: str,
+    integration: str,
+    package_schemas: dict[str, Any],
+) -> bool:
+    """Return True when schema data is absent or includes the integration/data stream."""
+    if version not in package_schemas:
+        return True
+    return integration in package_schemas[version]
+
+
+def _find_least_compatible_for_stack(
+    stack_version: Version,
+    integration_manifests: dict[str, Any],
+    integration: str | None = None,
+    package_schemas: dict[str, Any] | None = None,
+) -> str | None:
+    """Stack-dependent least compatible integration version (pre-#5601 behavior)."""
+    major_versions = sorted(
+        {Version.parse(manifest_version).major for manifest_version in integration_manifests},
+        reverse=True,
+    )
+    for max_major in major_versions:
+        major_integration_manifests = {
+            version: manifest
+            for version, manifest in integration_manifests.items()
+            if Version.parse(version).major == max_major
+        }
+        for version, manifest in sorted(major_integration_manifests.items(), key=lambda x: Version.parse(x[0])):
+            version_requirement = manifest["conditions"]["kibana"]["version"]
+            if not _satisfies_kibana_range(stack_version, version_requirement):
+                continue
+            if (
+                integration
+                and package_schemas is not None
+                and not _package_version_has_integration(version, integration, package_schemas)
+            ):
+                continue
+            return version
+    return None
+
+
+@dataclass(frozen=True)
+class RelatedIntegrationVersion:
+    """Resolved related_integrations.version value for the current package stack."""
+
+    expression: str
+    manifest_versions: tuple[str, ...]
+
+
+class IntegrationVersionNotFoundError(ValueError):
+    """Raised when a package has no compatible version for the requested stack/integration."""
+
+
+def _related_integration_version_operator(stack_version: Version) -> str:
+    """Return the semver operator for related_integrations.version on the current stack.
+
+    Stack ≥ 9.5 uses ``>=``; older stacks keep caret ranges. The
+    ``related_integrations_gte`` emit transform still rewrites any remaining
+    ``^`` values on ≥ 9.5 so export/view/package paths stay consistent.
+    """
+    if stack_version >= RELATED_INTEGRATION_GTE_OPERATOR_MIN_STACK:
+        return ">="
+    return "^"
+
+
+def resolve_related_integration_version(
+    package: str,
+    packages_manifest: dict[str, Any],
+    integration: str | None = None,
+) -> RelatedIntegrationVersion:
+    """Return the current-stack related_integrations.version expression."""
+    package_manifest = packages_manifest.get(package)
+    if package_manifest is None:
+        raise ValueError(f"Package {package} not found in manifest.")
+
+    package_schemas: dict[str, Any] = {}
+    if integration:
+        package_schemas = load_integrations_schemas().get(package, {})
+
+    integration_manifests = dict(sorted(package_manifest.items(), key=lambda x: Version.parse(x[0])))
+    current_stack = Version.parse(load_current_package_version(), optional_minor_and_patch=True)
+    manifest_version = _find_least_compatible_for_stack(
+        current_stack, integration_manifests, integration, package_schemas
+    )
+    if manifest_version is None:
+        package_label = f"{package}:{integration}" if integration else package
+        raise IntegrationVersionNotFoundError(f"no compatible version for integration {package_label}")
+
+    operator = _related_integration_version_operator(current_stack)
+    return RelatedIntegrationVersion(expression=f"{operator}{manifest_version}", manifest_versions=(manifest_version,))
+
+
+def find_latest_compatible_version(
+    package: str,
+    integration: str,
+    rule_stack_version: Version,
+    packages_manifest: dict[str, Any],
+    package_schemas: dict[str, Any] | None = None,
+) -> tuple[str, list[str]]:
+    """Finds latest compatible version for specified integration based on stack version supplied."""
+
+    if not package:
+        raise ValueError("Package must be specified")
+
+    package_manifest = packages_manifest.get(package)
+    if package_manifest is None:
+        raise ValueError(f"Package {package} not found in manifest.")
+
+    # Converts the dict keys (version numbers) to Version objects for proper sorting (descending)
+    integration_manifests = sorted(package_manifest.items(), key=lambda x: Version.parse(x[0]), reverse=True)
+    notice: list[str] = [""]
+    newest_skipped: tuple[str, Version] | None = None
+
+    for version, manifest in integration_manifests:
+        kibana_conditions = manifest.get("conditions", {}).get("kibana", {})
+        version_requirement = kibana_conditions.get("version")
+        if not version_requirement:
+            raise ValueError(f"Manifest for {package}:{integration} version {version} is missing conditions.")
+
+        if _satisfies_kibana_range(rule_stack_version, version_requirement):
+            if (
+                integration
+                and package_schemas is not None
+                and not _package_version_has_integration(version, integration, package_schemas)
+            ):
+                continue
+            if newest_skipped is not None:
+                skipped_version, skipped_floor = newest_skipped
+                integration_label = f" {integration.strip()}" if integration else ""
+                notice = [
+                    f"There is a new integration {package}{integration_label} version {skipped_version} available!",
+                    (
+                        f"Update the rule min_stack version from {rule_stack_version} to "
+                        f"{skipped_floor} if using new features in this latest version."
+                    ),
+                ]
+            return version, notice
+
+        # Track the newest manifest we had to skip so the notice can still
+        # point the reader at the most recent incompatible version and its floor.
+        if newest_skipped is None:
+            clauses = _parse_kibana_range(version_requirement)
+            floor = min(lo for lo, _ in clauses)
+            newest_skipped = (version, floor)
+
+    raise ValueError(f"no compatible version for integration {package}:{integration}")
+
+
+def get_integration_manifests(
+    integration: str,
+    prerelease: bool | None = False,
+    kibana_version: str | None = "",
+) -> list[Any]:
+    """Iterates over specified integrations from package-storage and combines manifests per version."""
+    epr_search_url = "https://epr.elastic.co/search"
+    prerelease_str = "true" if prerelease else "false"
+
+    # link for search parameters - https://github.com/elastic/package-registry
+    epr_search_parameters = {
+        "package": f"{integration}",
+        "prerelease": prerelease_str,
+        "all": "true",
+        "include_policy_templates": "true",
+    }
+    if kibana_version:
+        epr_search_parameters["kibana.version"] = kibana_version
+    epr_search_response = requests.get(epr_search_url, params=epr_search_parameters, timeout=10)
+    epr_search_response.raise_for_status()
+    manifests = epr_search_response.json()
+
+    if not manifests:
+        raise ValueError(f"EPR search for {integration} integration package returned empty list")
+
+    sorted_manifests = sorted(manifests, key=lambda p: Version.parse(p["version"]), reverse=True)
+    print(
+        f"loaded {integration} manifests from the following package versions: "
+        f"{[manifest['version'] for manifest in sorted_manifests]}"
+    )
+    return manifests
+
+
+def find_latest_integration_version(integration: str, maturity: str, stack_version: Version) -> Version:
+    """Finds the latest integration version based on maturity and stack version"""
+    prerelease = maturity != "ga"
+    existing_pkgs = get_integration_manifests(integration, prerelease, str(stack_version))
+    if maturity == "ga":
+        existing_pkgs = [pkg for pkg in existing_pkgs if not Version.parse(pkg["version"]).prerelease]
+    if maturity == "beta":
+        existing_pkgs = [pkg for pkg in existing_pkgs if Version.parse(pkg["version"]).prerelease]
+    return max([Version.parse(pkg["version"]) for pkg in existing_pkgs])
+
+
+# Using `Any` here because `integrations` and `rule` modules are tightly coupled
+def get_integration_schema_data(
+    data: Any,  # type: ignore[reportRedeclaration]
+    meta: Any,  # type: ignore[reportRedeclaration]
+    package_integrations: list[dict[str, Any]],
+) -> Iterator[dict[str, Any]]:
+    """Iterates over specified integrations from package-storage and combines schemas per version."""
+
+    data: QueryRuleData = data  # type: ignore[reportAssignmentType]  # noqa: PLW0127
+    meta: RuleMeta = meta  # noqa: PLW0127
+
+    # validate the query against related integration fields
+    if data.language != "lucene" and meta.maturity == "production":
+        for stack_version, mapping in meta.get_validation_stack_versions().items():
+            ecs_version = mapping["ecs"]
+            endgame_version = mapping["endgame"]
+            parsed_stack_version = Version.parse(stack_version)
+            patch_floor = find_latest_integration_patch_for_minor(
+                {pk_int["package"] for pk_int in package_integrations},
+                parsed_stack_version.major,
+                parsed_stack_version.minor,
+            )
+            min_stack = Version(
+                parsed_stack_version.major,
+                parsed_stack_version.minor,
+                max(parsed_stack_version.patch, patch_floor),
+            )
+
+            for pk_int in package_integrations:
+                package = pk_int["package"]
+                integration = pk_int["integration"]
+
+                # Extract the integration schema fields
+                integration_schema, package_version = get_integration_schema_fields(
+                    package, integration, min_stack, data
+                )
+
+                yield {
+                    "schema": integration_schema,
+                    "package": package,
+                    "integration": integration,
+                    "stack_version": stack_version,
+                    "ecs_version": ecs_version,
+                    "package_version": package_version,
+                    "endgame_version": endgame_version,
+                }
+
+
+def get_integration_schema_fields(
+    package: str,
+    integration: str,
+    min_stack: Version,
+    data: Any,  # type: ignore[reportRedeclaration]
+) -> tuple[dict[str, Any], str]:
+    """Extracts the integration fields to schema based on the bundled package integrations."""
+    data: QueryRuleData = data  # type: ignore[reportAssignmentType]  # noqa: PLW0127
+    # Resolves against the bundled integration-manifests / integration-schemas via memoized helpers
+    # keyed on hashable args. The returned schema is memoized and shared, so callers must treat it
+    # as read-only.
+    package_version, notice = _latest_compatible_version_from_etc(package, integration, str(min_stack))
+    notify_user_if_update_available(data, list(notice), integration)
+
+    integration_schema = _integration_schema(package, package_version, integration)
+    return integration_schema, package_version
+
+
+@cached
+def _latest_compatible_version_from_etc(
+    package: str, integration: str, stack_version: str
+) -> tuple[str, tuple[str, ...]]:
+    """Memoized `find_latest_compatible_version` against the bundled manifests and schemas."""
+    # Resolving a version re-parses and re-sorts every manifest version, and rules repeat the
+    # same lookups across stack versions. Failures are not cached and re-raise.
+    packages_manifest = load_integrations_manifests()
+    package_schemas = load_integrations_schemas().get(package, {}) if integration else None
+    version, notice = find_latest_compatible_version(
+        package,
+        integration,
+        Version.parse(stack_version),
+        packages_manifest,
+        package_schemas=package_schemas,
+    )
+    # tuple so the memoized notice cannot be mutated by a caller
+    return version, tuple(notice)
+
+
+@cached
+def _integration_schema(package: str, package_version: str, integration: str) -> dict[str, Any]:
+    """Build the bundled integration fields into a memoized `field -> type family` schema."""
+    # Packages populate only a subset of ECS, so the full ECS schema is not unioned in.
+    schema = collect_schema_fields(load_integrations_schemas(), package, package_version, integration)
+    # Memoized and shared, so callers must treat the returned dict as read-only.
+    return {key: kql.parser.elasticsearch_type_family(value) for key, value in schema.items()}
+
+
+def notify_user_if_update_available(
+    data: Any,  # type: ignore[reportRedeclaration]
+    notice: list[str],
+    integration: str,
+) -> None:
+    """Notifies the user if an update is available, only once per integration."""
+
+    data: QueryRuleData = data  # type: ignore[reportAssignmentType]  # noqa: PLW0127
+
+    if notice and data.get("notify", False) and integration not in _notified_integrations:
+        # flag to only warn once per integration for available upgrades
+        _notified_integrations.add(integration)
+
+        print(f"\n{data.get('name')}")
+        print("\n".join(notice))
+
+
+def collect_schema_fields(
+    integrations_schemas: dict[str, Any],
+    package: str,
+    package_version: str,
+    integration: str | None = None,
+) -> dict[str, Any]:
+    """Collects the schema fields for a given integration."""
+    if integration is None:
+        return {
+            field: value
+            for dataset in integrations_schemas[package][package_version]
+            if dataset != "jobs"
+            for field, value in integrations_schemas[package][package_version][dataset].items()
+        }
+
+    if integration not in integrations_schemas[package][package_version]:
+        raise ValueError(f"Integration {integration} not found in package {package} version {package_version}")
+
+    return dict(integrations_schemas[package][package_version][integration])
+
+
+def parse_datasets(datasets: list[str], package_manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    """Parses datasets into packaged integrations from rule data."""
+    packaged_integrations: list[dict[str, Any]] = []
+    # FIXME @eric-forte-elastic: evaluate using EventDataset dataclass for parsing # noqa: FIX001, TD001, TD003
+    for _value in sorted(datasets):
+        # cleanup extra quotes pulled from ast field
+        value = _value.strip('"')
+
+        integration = UNKNOWN_PACKAGE_INTEGRATION
+        if "." in value:
+            package, integration = value.split(".", 1)
+            # Handle cases where endpoint event datasource needs to be parsed uniquely (e.g endpoint.events.network)
+            # as endpoint.network
+            if package == "endpoint" and "events" in integration:
+                integration = integration.split(".")[1]
+        else:
+            package = value
+
+        if package in list(package_manifest):
+            packaged_integrations.append({"package": package, "integration": integration})
+    return packaged_integrations
+
+
+class SecurityDetectionEngine:
+    """Dedicated to Security Detection Engine integration."""
+
+    def __init__(self) -> None:
+        self.epr_url = "https://epr.elastic.co/package/security_detection_engine/"
+
+    def load_integration_assets(self, package_version: Version) -> dict[str, Any]:
+        """Loads integration assets into memory."""
+
+        epr_package_url = f"{self.epr_url}{package_version!s}/"
+        epr_response = requests.get(epr_package_url, timeout=10)
+        epr_response.raise_for_status()
+        package_obj = epr_response.json()
+        zip_url = f"https://epr.elastic.co{package_obj['download']}"
+        zip_response = requests.get(zip_url, timeout=30)
+        with unzip(zip_response.content) as zip_package:
+            asset_file_names = [asset for asset in zip_package.namelist() if "json" in asset]
+            return {
+                x.split("/")[-1].replace(".json", ""): json.loads(zip_package.read(x).decode("utf-8"))
+                for x in asset_file_names
+            }
+
+    def keep_latest_versions(
+        self,
+        assets: dict[str, dict[str, Any]],
+        num_versions: int = DEFAULT_MAX_RULE_VERSIONS,
+    ) -> dict[str, Any]:
+        """Keeps only the latest N versions of each rule to limit historical rule versions in our release package."""
+
+        # Dictionary to hold the sorted list of versions for each base rule ID
+        rule_versions: dict[str, list[tuple[int, str]]] = defaultdict(list)
+
+        # Only version-limit assets that look like rules (have attributes.rule_id and attributes.version).
+        # Other JSON assets in the package (e.g. manifest) are skipped; add_historical_rules expects only rules.
+        filtered_assets: dict[str, Any] = {}
+
+        for key, asset in assets.items():
+            attrs = asset.get("attributes")
+            if not attrs or "rule_id" not in attrs or "version" not in attrs:
+                continue
+            base_id = attrs["rule_id"]
+            version = int(attrs["version"])
+            rule_versions[base_id].append((version, key))
+
+        # Keep only the last/latest num_versions versions for each rule
+        # Sort versions and take the last num_versions
+        # Add the latest versions of the rule to the filtered assets
+        for versions in rule_versions.values():
+            latest_versions = sorted(versions, key=lambda x: x[0], reverse=True)[:num_versions]
+            for _, key in latest_versions:
+                filtered_assets[key] = assets[key]
+
+        return filtered_assets

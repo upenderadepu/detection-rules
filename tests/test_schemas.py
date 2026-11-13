@@ -4,14 +4,28 @@
 # 2.0.
 
 """Test stack versioned schemas."""
+
 import copy
+import os
 import unittest
+import unittest.mock
 import uuid
+from pathlib import Path
+from typing import Any
 
 import eql
+import pytest
+from marshmallow import ValidationError
+from semver import Version
 
+from detection_rules import ecs, utils
+from detection_rules.config import load_current_package_version
+from detection_rules.custom_schemas import get_custom_schemas
+from detection_rules.esql_errors import EsqlSemanticError, EsqlSyntaxError
 from detection_rules.rule import TOMLRuleContents
-from detection_rules.schemas import downgrade, CurrentSchema
+from detection_rules.rule_loader import RuleCollection
+from detection_rules.schemas import RULES_CONFIG, downgrade, get_stack_schemas
+from detection_rules.version_lock import VersionLockFile
 
 
 class TestSchemas(unittest.TestCase):
@@ -19,6 +33,8 @@ class TestSchemas(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        cls.current_version = load_current_package_version()
+
         # expected contents for a downgraded rule
         cls.v78_kql = {
             "description": "test description",
@@ -36,7 +52,7 @@ class TestSchemas(unittest.TestCase):
                     "tactic": {
                         "id": "TA0001",
                         "name": "Execution",
-                        "reference": "https://attack.mitre.org/tactics/TA0001/"
+                        "reference": "https://attack.mitre.org/tactics/TA0001/",
                     },
                     "technique": [
                         {
@@ -46,25 +62,25 @@ class TestSchemas(unittest.TestCase):
                         }
                     ],
                 }
-            ]
+            ],
         }
         cls.v79_kql = dict(cls.v78_kql, author=["Elastic"], license="Elastic License v2")
         cls.v711_kql = copy.deepcopy(cls.v79_kql)
         # noinspection PyTypeChecker
-        cls.v711_kql["threat"][0]["technique"][0]["subtechnique"] = [{
-            "id": "T1059.001",
-            "name": "PowerShell",
-            "reference": "https://attack.mitre.org/techniques/T1059/001/"
-        }]
+        cls.v711_kql["threat"][0]["technique"][0]["subtechnique"] = [
+            {"id": "T1059.001", "name": "PowerShell", "reference": "https://attack.mitre.org/techniques/T1059/001/"}
+        ]
         # noinspection PyTypeChecker
-        cls.v711_kql["threat"].append({
-            "framework": "MITRE ATT&CK",
-            "tactic": {
-                "id": "TA0008",
-                "name": "Lateral Movement",
-                "reference": "https://attack.mitre.org/tactics/TA0008/"
-            },
-        })
+        cls.v711_kql["threat"].append(
+            {
+                "framework": "MITRE ATT&CK",
+                "tactic": {
+                    "id": "TA0008",
+                    "name": "Lateral Movement",
+                    "reference": "https://attack.mitre.org/tactics/TA0008/",
+                },
+            }
+        )
 
         cls.v79_threshold_contents = {
             "author": ["Elastic"],
@@ -82,17 +98,20 @@ class TestSchemas(unittest.TestCase):
             },
             "type": "threshold",
         }
-        cls.v712_threshold_rule = dict(copy.deepcopy(cls.v79_threshold_contents), threshold={
-            'field': ['destination.bytes', 'process.args'],
-            'value': 75,
-            'cardinality': {
-                'field': 'user.name',
-                'value': 2
-            }
-        })
+        cls.v712_threshold_rule = dict(
+            copy.deepcopy(cls.v79_threshold_contents),
+            threshold={
+                "field": ["destination.bytes", "process.args"],
+                "value": 75,
+                "cardinality": [{"field": "user.name", "value": 2}],
+            },
+        )
 
-    def test_query_downgrade(self):
+    def test_query_downgrade_7_x(self):
         """Downgrade a standard KQL rule."""
+        if Version.parse(self.current_version, optional_minor_and_patch=True).major > 7:
+            return
+
         self.assertDictEqual(downgrade(self.v711_kql, "7.11"), self.v711_kql)
         self.assertDictEqual(downgrade(self.v711_kql, "7.9"), self.v79_kql)
         self.assertDictEqual(downgrade(self.v711_kql, "7.9.2"), self.v79_kql)
@@ -107,10 +126,13 @@ class TestSchemas(unittest.TestCase):
             downgrade(self.v79_kql, "7.7")
 
         with self.assertRaises(ValueError):
-            downgrade(self.v78_kql, "7.7")
+            downgrade(self.v78_kql, "7.7", current_version="7.8")
 
-    def test_versioned_downgrade(self):
+    def test_versioned_downgrade_7_x(self):
         """Downgrade a KQL rule with version information"""
+        if Version.parse(self.current_version, optional_minor_and_patch=True).major > 7:
+            return
+
         api_contents = self.v79_kql
         self.assertDictEqual(downgrade(api_contents, "7.9"), api_contents)
         self.assertDictEqual(downgrade(api_contents, "7.9.2"), api_contents)
@@ -124,24 +146,27 @@ class TestSchemas(unittest.TestCase):
         with self.assertRaises(ValueError):
             downgrade(api_contents, "7.7")
 
-    def test_threshold_downgrade(self):
+    def test_threshold_downgrade_7_x(self):
         """Downgrade a threshold rule that was first introduced in 7.9."""
-        api_contents = self.v712_threshold_rule
-        self.assertDictEqual(downgrade(api_contents, CurrentSchema.STACK_VERSION), api_contents)
-        self.assertDictEqual(downgrade(api_contents, CurrentSchema.STACK_VERSION + '.1'), api_contents)
+        if Version.parse(self.current_version, optional_minor_and_patch=True).major > 7:
+            return
 
-        exc_msg = 'Cannot downgrade a threshold rule that has multiple threshold fields defined'
+        api_contents = self.v712_threshold_rule
+        self.assertDictEqual(downgrade(api_contents, "7.13"), api_contents)
+        self.assertDictEqual(downgrade(api_contents, "7.13.1"), api_contents)
+
+        exc_msg = "Cannot downgrade a threshold rule that has multiple threshold fields defined"
         with self.assertRaisesRegex(ValueError, exc_msg):
-            downgrade(api_contents, '7.9')
+            downgrade(api_contents, "7.9")
 
         v712_threshold_contents_single_field = copy.deepcopy(api_contents)
-        v712_threshold_contents_single_field['threshold']['field'].pop()
+        v712_threshold_contents_single_field["threshold"]["field"].pop()
 
         with self.assertRaisesRegex(ValueError, "Cannot downgrade a threshold rule that has a defined cardinality"):
             downgrade(v712_threshold_contents_single_field, "7.9")
 
         v712_no_cardinality = copy.deepcopy(v712_threshold_contents_single_field)
-        v712_no_cardinality['threshold'].pop('cardinality')
+        v712_no_cardinality["threshold"].pop("cardinality")
         self.assertEqual(downgrade(v712_no_cardinality, "7.9"), self.v79_threshold_contents)
 
         with self.assertRaises(ValueError):
@@ -149,6 +174,21 @@ class TestSchemas(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "Unsupported rule type"):
             downgrade(v712_no_cardinality, "7.8")
+
+    def test_query_downgrade_8_x(self):
+        """Downgrade a standard KQL rule."""
+        if Version.parse(self.current_version, optional_minor_and_patch=True).major > 8:
+            return
+
+    def test_versioned_downgrade_8_x(self):
+        """Downgrade a KQL rule with version information"""
+        if Version.parse(self.current_version, optional_minor_and_patch=True).major > 8:
+            return
+
+    def test_threshold_downgrade_8_x(self):
+        """Downgrade a threshold rule that was first introduced in 7.9."""
+        if Version.parse(self.current_version, optional_minor_and_patch=True).major > 7:
+            return
 
     def test_eql_validation(self):
         base_fields = {
@@ -161,11 +201,15 @@ class TestSchemas(unittest.TestCase):
             "risk_score": 21,
             "rule_id": str(uuid.uuid4()),
             "severity": "low",
-            "type": "eql"
+            "type": "eql",
         }
 
         def build_rule(query):
-            metadata = {"creation_date": "1970/01/01", "updated_date": "1970/01/01"}
+            metadata = {
+                "creation_date": "1970/01/01",
+                "updated_date": "1970/01/01",
+                "min_stack_version": load_current_package_version(),
+            }
             data = base_fields.copy()
             data["query"] = query
             obj = {"metadata": metadata, "rule": data}
@@ -174,6 +218,28 @@ class TestSchemas(unittest.TestCase):
         build_rule("""
             process where process.name == "cmd.exe"
         """)
+
+        example_text_fields = [
+            "client.as.organization.name.text",
+            "client.user.full_name.text",
+            "client.user.name.text",
+            "destination.as.organization.name.text",
+            "destination.user.full_name.text",
+            "destination.user.name.text",
+            "error.message",
+            "error.stack_trace.text",
+            "file.path.text",
+            "file.target_path.text",
+            "host.os.full.text",
+            "host.os.name.text",
+            "host.user.full_name.text",
+            "host.user.name.text",
+        ]
+        for text_field in example_text_fields:
+            with self.assertRaises(eql.parser.EqlSchemaError):
+                build_rule(f"""
+                        any where {text_field} == "some string field"
+                """)
 
         with self.assertRaises(eql.EqlSyntaxError):
             build_rule("""
@@ -189,3 +255,814 @@ class TestSchemas(unittest.TestCase):
             build_rule("""
                     process where process.pid == "some string field"
             """)
+
+    def test_empty_kuery_with_filters_is_valid_for_custom_rules(self):
+        """Filter-only KQL custom rules can load without a query (issue #6167)."""
+        metadata = {
+            "creation_date": "1970/01/01",
+            "updated_date": "1970/01/01",
+            "min_stack_version": load_current_package_version(),
+        }
+        data = {
+            "author": ["Elastic"],
+            "description": "test description",
+            "filters": [{"meta": {"negate": False}, "query": {"match_phrase": {"host.name": "test-host"}}}],
+            "index": ["logs-*"],
+            "language": "kuery",
+            "license": "Elastic License v2",
+            "name": "test rule",
+            "query": "",
+            "risk_score": 21,
+            "rule_id": str(uuid.uuid4()),
+            "severity": "low",
+            "type": "query",
+        }
+        with unittest.mock.patch("detection_rules.rule.CUSTOM_RULES_DIR", "custom-rules-dir"):
+            rule = TOMLRuleContents.from_dict({"metadata": metadata, "rule": data})
+        self.assertEqual(rule.data.query, "")
+        self.assertIsNone(rule.data.validator)
+
+    def test_missing_kuery_with_filters_is_normalized_for_custom_rules(self):
+        """Missing filter-only KQL query is normalized to an empty string for export (issue #6167)."""
+        metadata = {
+            "creation_date": "1970/01/01",
+            "updated_date": "1970/01/01",
+            "min_stack_version": load_current_package_version(),
+        }
+        data = {
+            "author": ["Elastic"],
+            "description": "test description",
+            "filters": [{"meta": {"negate": False}, "query": {"match_phrase": {"host.name": "test-host"}}}],
+            "index": ["logs-*"],
+            "language": "kuery",
+            "license": "Elastic License v2",
+            "name": "test rule",
+            "risk_score": 21,
+            "rule_id": str(uuid.uuid4()),
+            "severity": "low",
+            "type": "query",
+        }
+        with unittest.mock.patch("detection_rules.rule.CUSTOM_RULES_DIR", "custom-rules-dir"):
+            rule = TOMLRuleContents.from_dict({"metadata": metadata, "rule": data})
+        self.assertEqual(rule.data.query, "")
+        self.assertEqual(rule.to_dict()["rule"]["query"], "")
+
+    def test_empty_kuery_with_filters_is_invalid_for_prebuilt_rules(self):
+        """Empty KQL remains invalid outside custom filter-only rule loading."""
+        metadata = {
+            "creation_date": "1970/01/01",
+            "updated_date": "1970/01/01",
+            "min_stack_version": load_current_package_version(),
+        }
+        data = {
+            "author": ["Elastic"],
+            "description": "test description",
+            "filters": [{"meta": {"negate": False}, "query": {"match_phrase": {"host.name": "test-host"}}}],
+            "index": ["logs-*"],
+            "language": "kuery",
+            "license": "Elastic License v2",
+            "name": "test rule",
+            "query": "",
+            "risk_score": 21,
+            "rule_id": str(uuid.uuid4()),
+            "severity": "low",
+            "type": "query",
+        }
+        with (
+            unittest.mock.patch("detection_rules.rule.CUSTOM_RULES_DIR", None),
+            self.assertRaises(ValidationError),
+        ):
+            TOMLRuleContents.from_dict({"metadata": metadata, "rule": data})
+
+    def test_empty_kuery_without_filters_is_invalid_for_custom_rules(self):
+        """Custom KQL rules still require query text when no filters are present."""
+        metadata = {
+            "creation_date": "1970/01/01",
+            "updated_date": "1970/01/01",
+            "min_stack_version": load_current_package_version(),
+        }
+        data = {
+            "author": ["Elastic"],
+            "description": "test description",
+            "index": ["logs-*"],
+            "language": "kuery",
+            "license": "Elastic License v2",
+            "name": "test rule",
+            "query": "",
+            "risk_score": 21,
+            "rule_id": str(uuid.uuid4()),
+            "severity": "low",
+            "type": "query",
+        }
+        with (
+            unittest.mock.patch("detection_rules.rule.CUSTOM_RULES_DIR", "custom-rules-dir"),
+            self.assertRaises(ValidationError),
+        ):
+            TOMLRuleContents.from_dict({"metadata": metadata, "rule": data})
+
+    def test_kuery_with_nonempty_query_and_filters_valid(self):
+        """Kuery rule with a non-empty query and filters loads successfully as a custom rule."""
+        filters = [
+            {
+                "$state": {"store": "appState"},
+                "meta": {
+                    "disabled": False,
+                    "field": "Effective_process.pid",
+                    "index": "apm-*-transaction*,auditbeat-*,endgame-*,filebeat-*,logs-*,packetbeat-*,traces-apm*,winlogbeat-*,-*elastic-cloud-logs-*",
+                    "key": "Effective_process.pid",
+                    "negate": False,
+                    "type": "phrase",
+                    "params": {"query": "54321"},
+                },
+                "query": {"match_phrase": {"Effective_process.pid": "54321"}},
+            }
+        ]
+        metadata = {
+            "creation_date": "1970/01/01",
+            "updated_date": "1970/01/01",
+            "min_stack_version": load_current_package_version(),
+        }
+        data = {
+            "author": ["Elastic"],
+            "description": "test description",
+            "filters": filters,
+            "index": ["filebeat-*", "packetbeat-*"],
+            "language": "kuery",
+            "license": "Elastic License v2",
+            "name": "test rule",
+            "query": "event.category:(network or network_traffic)",
+            "risk_score": 21,
+            "rule_id": str(uuid.uuid4()),
+            "severity": "low",
+            "type": "query",
+        }
+        with unittest.mock.patch("detection_rules.rule.CUSTOM_RULES_DIR", "custom-rules-dir"):
+            TOMLRuleContents.from_dict({"metadata": metadata, "rule": data})
+
+    def test_kuery_with_empty_query_and_filters_valid(self):
+        """Filter-only kuery rule with empty query and filters loads successfully as a custom rule."""
+        filters = [
+            {
+                "$state": {"store": "appState"},
+                "meta": {
+                    "disabled": False,
+                    "field": "Effective_process.pid",
+                    "index": "apm-*-transaction*,auditbeat-*,endgame-*,filebeat-*,logs-*,packetbeat-*,traces-apm*,winlogbeat-*,-*elastic-cloud-logs-*",
+                    "key": "Effective_process.pid",
+                    "negate": False,
+                    "type": "phrase",
+                    "params": {"query": "54321"},
+                },
+                "query": {"match_phrase": {"Effective_process.pid": "54321"}},
+            }
+        ]
+        metadata = {
+            "creation_date": "1970/01/01",
+            "updated_date": "1970/01/01",
+            "min_stack_version": load_current_package_version(),
+        }
+        data = {
+            "author": ["Elastic"],
+            "description": "test description",
+            "filters": filters,
+            "index": ["filebeat-*", "packetbeat-*"],
+            "language": "kuery",
+            "license": "Elastic License v2",
+            "name": "test rule",
+            "query": "",
+            "risk_score": 21,
+            "rule_id": str(uuid.uuid4()),
+            "severity": "low",
+            "type": "query",
+        }
+        with unittest.mock.patch("detection_rules.rule.CUSTOM_RULES_DIR", "custom-rules-dir"):
+            TOMLRuleContents.from_dict({"metadata": metadata, "rule": data})
+
+    def test_empty_kuery_with_filters_invalid_without_custom_rules_dir(self):
+        """Filter-only kuery rule with empty query raises a ValidationError when CUSTOM_RULES_DIR is not set."""
+        filters = [
+            {
+                "$state": {"store": "appState"},
+                "meta": {
+                    "disabled": False,
+                    "field": "Effective_process.pid",
+                    "index": "apm-*-transaction*,auditbeat-*,endgame-*,filebeat-*,logs-*,packetbeat-*,traces-apm*,winlogbeat-*,-*elastic-cloud-logs-*",
+                    "key": "Effective_process.pid",
+                    "negate": False,
+                    "type": "phrase",
+                    "params": {"query": "54321"},
+                },
+                "query": {"match_phrase": {"Effective_process.pid": "54321"}},
+            }
+        ]
+        metadata = {
+            "creation_date": "1970/01/01",
+            "updated_date": "1970/01/01",
+            "min_stack_version": load_current_package_version(),
+        }
+        data = {
+            "author": ["Elastic"],
+            "description": "test description",
+            "filters": filters,
+            "index": ["filebeat-*", "packetbeat-*"],
+            "language": "kuery",
+            "license": "Elastic License v2",
+            "name": "test rule",
+            "query": "",
+            "risk_score": 21,
+            "rule_id": str(uuid.uuid4()),
+            "severity": "low",
+            "type": "query",
+        }
+        with (
+            unittest.mock.patch("detection_rules.rule.CUSTOM_RULES_DIR", None),
+            self.assertRaises(ValidationError),
+        ):
+            TOMLRuleContents.from_dict({"metadata": metadata, "rule": data})
+
+    def test_threat_match_with_nonempty_threat_query_and_filters_valid(self):
+        """Threat match rule with a non-empty threat_query and threat_filters loads successfully as a custom rule."""
+        threat_filters = [
+            {
+                "$state": {"store": "appState"},
+                "meta": {
+                    "disabled": False,
+                    "key": "event.category",
+                    "negate": False,
+                    "type": "phrase",
+                    "params": {"query": "threat"},
+                },
+                "query": {"match_phrase": {"event.category": "threat"}},
+            },
+            {
+                "$state": {"store": "appState"},
+                "meta": {
+                    "disabled": False,
+                    "key": "event.kind",
+                    "negate": False,
+                    "type": "phrase",
+                    "params": {"query": "enrichment"},
+                },
+                "query": {"match_phrase": {"event.kind": "enrichment"}},
+            },
+            {
+                "$state": {"store": "appState"},
+                "meta": {
+                    "disabled": False,
+                    "key": "event.type",
+                    "negate": False,
+                    "type": "phrase",
+                    "params": {"query": "indicator"},
+                },
+                "query": {"match_phrase": {"event.type": "indicator"}},
+            },
+        ]
+        metadata = {
+            "creation_date": "1970/01/01",
+            "updated_date": "1970/01/01",
+            "min_stack_version": load_current_package_version(),
+        }
+        data = {
+            "author": ["Elastic"],
+            "description": "test description",
+            "index": ["filebeat-*", "logs-*"],
+            "language": "kuery",
+            "license": "Elastic License v2",
+            "name": "test rule",
+            "query": "source.ip:* or destination.ip:*",
+            "risk_score": 21,
+            "rule_id": str(uuid.uuid4()),
+            "severity": "low",
+            "threat_filters": threat_filters,
+            "threat_index": ["filebeat-*", "logs-ti_*"],
+            "threat_indicator_path": "threat.indicator",
+            "threat_language": "kuery",
+            "threat_mapping": [
+                {"entries": [{"field": "source.ip", "type": "mapping", "value": "threat.indicator.ip"}]}
+            ],
+            "threat_query": "event.category:threat",
+            "type": "threat_match",
+        }
+        TOMLRuleContents.from_dict({"metadata": metadata, "rule": data})
+
+    def test_threat_match_with_empty_threat_query_and_filters_valid(self):
+        """Threat match filter-only rule with empty threat_query and threat_filters loads successfully."""
+        threat_filters = [
+            {
+                "$state": {"store": "appState"},
+                "meta": {
+                    "disabled": False,
+                    "key": "event.category",
+                    "negate": False,
+                    "type": "phrase",
+                    "params": {"query": "threat"},
+                },
+                "query": {"match_phrase": {"event.category": "threat"}},
+            },
+            {
+                "$state": {"store": "appState"},
+                "meta": {
+                    "disabled": False,
+                    "key": "event.kind",
+                    "negate": False,
+                    "type": "phrase",
+                    "params": {"query": "enrichment"},
+                },
+                "query": {"match_phrase": {"event.kind": "enrichment"}},
+            },
+            {
+                "$state": {"store": "appState"},
+                "meta": {
+                    "disabled": False,
+                    "key": "event.type",
+                    "negate": False,
+                    "type": "phrase",
+                    "params": {"query": "indicator"},
+                },
+                "query": {"match_phrase": {"event.type": "indicator"}},
+            },
+        ]
+        metadata = {
+            "creation_date": "1970/01/01",
+            "updated_date": "1970/01/01",
+            "min_stack_version": load_current_package_version(),
+        }
+        data = {
+            "author": ["Elastic"],
+            "description": "test description",
+            "index": ["filebeat-*", "logs-*"],
+            "language": "kuery",
+            "license": "Elastic License v2",
+            "name": "test rule",
+            "query": "source.ip:* or destination.ip:*",
+            "risk_score": 21,
+            "rule_id": str(uuid.uuid4()),
+            "severity": "low",
+            "threat_filters": threat_filters,
+            "threat_index": ["filebeat-*", "logs-ti_*"],
+            "threat_indicator_path": "threat.indicator",
+            "threat_language": "kuery",
+            "threat_mapping": [
+                {"entries": [{"field": "source.ip", "type": "mapping", "value": "threat.indicator.ip"}]}
+            ],
+            "threat_query": "",
+            "type": "threat_match",
+        }
+        TOMLRuleContents.from_dict({"metadata": metadata, "rule": data})
+
+    def test_empty_threat_query_preserved_on_export_roundtrip(self):
+        """Empty threat_query with threat_filters survives a to_dict → from_dict round-trip (issue #6283)."""
+        threat_filters = [
+            {
+                "$state": {"store": "appState"},
+                "meta": {
+                    "disabled": False,
+                    "key": "event.category",
+                    "negate": False,
+                    "type": "phrase",
+                    "params": {"query": "threat"},
+                },
+                "query": {"match_phrase": {"event.category": "threat"}},
+            },
+            {
+                "$state": {"store": "appState"},
+                "meta": {
+                    "disabled": False,
+                    "key": "event.kind",
+                    "negate": False,
+                    "type": "phrase",
+                    "params": {"query": "enrichment"},
+                },
+                "query": {"match_phrase": {"event.kind": "enrichment"}},
+            },
+            {
+                "$state": {"store": "appState"},
+                "meta": {
+                    "disabled": False,
+                    "key": "event.type",
+                    "negate": False,
+                    "type": "phrase",
+                    "params": {"query": "indicator"},
+                },
+                "query": {"match_phrase": {"event.type": "indicator"}},
+            },
+        ]
+        metadata = {
+            "creation_date": "1970/01/01",
+            "updated_date": "1970/01/01",
+            "min_stack_version": load_current_package_version(),
+        }
+        data = {
+            "author": ["Elastic"],
+            "description": "test description",
+            "index": ["filebeat-*", "logs-*"],
+            "language": "kuery",
+            "license": "Elastic License v2",
+            "name": "test rule",
+            "query": "source.ip:* or destination.ip:*",
+            "risk_score": 21,
+            "rule_id": str(uuid.uuid4()),
+            "severity": "low",
+            "threat_filters": threat_filters,
+            "threat_index": ["filebeat-*", "logs-ti_*"],
+            "threat_indicator_path": "threat.indicator",
+            "threat_language": "kuery",
+            "threat_mapping": [
+                {"entries": [{"field": "source.ip", "type": "mapping", "value": "threat.indicator.ip"}]}
+            ],
+            "threat_query": "",
+            "type": "threat_match",
+        }
+        rule = TOMLRuleContents.from_dict({"metadata": metadata, "rule": data})
+        self.assertEqual(rule.data.threat_query, "")
+
+        exported = rule.to_dict()
+        self.assertEqual(exported["rule"].get("threat_query"), "")
+
+        reimported = TOMLRuleContents.from_dict(exported)
+        self.assertEqual(reimported.data.threat_query, "")
+
+    def test_response_actions_validation(self) -> None:
+        """Test that response actions are properly validated in the schema."""
+        base_fields: dict[str, Any] = {
+            "author": ["Elastic"],
+            "description": "test description",
+            "index": ["logs-endpoint.events.*"],
+            "language": "kuery",
+            "license": "Elastic License v2",
+            "name": "test rule",
+            "query": "process.name:test.query",
+            "risk_score": 21,
+            "rule_id": str(uuid.uuid4()),
+            "severity": "low",
+            "type": "query",
+        }
+
+        def build_rule(response_actions: list[dict[str, Any]]) -> TOMLRuleContents:
+            """Helper function to build a TOMLRuleContents object."""
+            metadata = {
+                "creation_date": "1970/01/01",
+                "updated_date": "1970/01/01",
+                "min_stack_version": load_current_package_version(),
+            }
+            data = base_fields.copy()
+            data["response_actions"] = response_actions
+            return TOMLRuleContents.from_dict({"metadata": metadata, "rule": data})
+
+        response_actions = [
+            {
+                "action_type_id": ".osquery",
+                "params": {
+                    "query": "select * from processes;",
+                    "timeout": 120,
+                    "ecs_mapping": {"process.pid": {"field": "pid"}},
+                    "queries": [{"id": "processes", "query": "select * from processes;"}],
+                },
+            },
+            {"action_type_id": ".endpoint", "params": {"command": "isolate", "comment": "isolate host"}},
+            {
+                "action_type_id": ".endpoint",
+                "params": {
+                    "command": "kill-process",
+                    "comment": "kill process",
+                    "config": {"field": "", "overwrite": True},
+                },
+            },
+        ]
+        contents = build_rule(response_actions)
+        self.assertEqual(contents.to_api_format()["response_actions"], response_actions)
+
+    def test_system_actions_no_frequency_injection(self) -> None:
+        """System actions (e.g. .cases, .workflows) must not get a frequency.throttle null injected."""
+        base_fields: dict[str, Any] = {
+            "author": ["Elastic"],
+            "description": "test description",
+            "index": ["logs-endpoint.events.*"],
+            "language": "kuery",
+            "license": "Elastic License v2",
+            "name": "test rule",
+            "query": "process.name:test.query",
+            "risk_score": 21,
+            "rule_id": str(uuid.uuid4()),
+            "severity": "low",
+            "type": "query",
+        }
+
+        def build_rule(actions: list[dict[str, Any]]) -> TOMLRuleContents:
+            """Helper function to build a TOMLRuleContents object with actions."""
+            metadata = {
+                "creation_date": "1970/01/01",
+                "updated_date": "1970/01/01",
+                "min_stack_version": load_current_package_version(),
+            }
+            data = base_fields.copy()
+            data["actions"] = actions
+            return TOMLRuleContents.from_dict({"metadata": metadata, "rule": data})
+
+        # A standard connector action gets the frequency.throttle null injected,
+        # while system actions (.cases, .workflows) must be left untouched.
+        actions = [
+            {
+                "action_type_id": ".slack",
+                "id": "slack-connector-id",
+                "group": "default",
+                "params": {"message": "test"},
+            },
+            {
+                "action_type_id": ".cases",
+                "id": "system-connector-.cases",
+                "params": {"subAction": "run", "subActionParams": {"timeWindow": "7d"}},
+            },
+            {
+                "action_type_id": ".workflows",
+                "id": "system-connector-.workflows",
+                "params": {"subAction": "run", "subActionParams": {"workflowId": "abc123"}},
+            },
+        ]
+        api_actions = build_rule(actions).to_api_format()["actions"]
+        by_type = {action["action_type_id"]: action for action in api_actions}
+
+        # The standard connector should have the throttle null added.
+        self.assertIn("frequency", by_type[".slack"])
+        self.assertIsNone(by_type[".slack"]["frequency"]["throttle"])
+
+        # System actions should not have a frequency injected.
+        self.assertNotIn("frequency", by_type[".cases"])
+        self.assertNotIn("frequency", by_type[".workflows"])
+
+
+class TestVersionLockSchema(unittest.TestCase):
+    """Test that the version lock has proper entries."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.version_lock_contents = {
+            "33f306e8-417c-411b-965c-c2812d6d3f4d": {
+                "rule_name": "Remote File Download via PowerShell",
+                "sha256": "8679cd72bf85b67dde3dcfdaba749ed1fa6560bca5efd03ed41c76a500ce31d6",
+                "type": "eql",
+                "version": 4,
+            },
+            "34fde489-94b0-4500-a76f-b8a157cf9269": {
+                "min_stack_version": "8.2",
+                "previous": {
+                    "7.13": {
+                        "rule_name": "Telnet Port Activity",
+                        "sha256": "3dd4a438c915920e6ddb0a5212603af5d94fb8a6b51a32f223d930d7e3becb89",
+                        "type": "query",
+                        "version": 9,
+                    }
+                },
+                "rule_name": "Telnet Port Activity",
+                "sha256": "b0bdfa73639226fb83eadc0303ad1801e0707743f96a36209aa58228d3bf6a89",
+                "type": "query",
+                "version": 10,
+            },
+        }
+
+    def test_version_lock_no_previous(self):
+        """Pass field validation on version lock without nested previous fields"""
+        version_lock_contents = copy.deepcopy(self.version_lock_contents)
+        VersionLockFile.from_dict({"data": version_lock_contents})
+
+    @unittest.skipIf(RULES_CONFIG.bypass_version_lock, "Version lock bypassed")
+    def test_version_lock_has_nested_previous(self):
+        """Fail field validation on version lock with nested previous fields"""
+        version_lock_contents = copy.deepcopy(self.version_lock_contents)
+        with self.assertRaises(ValidationError):
+            previous = version_lock_contents["34fde489-94b0-4500-a76f-b8a157cf9269"]["previous"]
+            version_lock_contents["34fde489-94b0-4500-a76f-b8a157cf9269"]["previous"]["previous"] = previous
+            VersionLockFile.from_dict({"data": version_lock_contents})
+
+
+class TestVersions(unittest.TestCase):
+    """Test that schema versioning aligns."""
+
+    def test_stack_schema_map(self):
+        """Test to ensure that an entry exists in the stack-schema-map for the current package version."""
+        package_version = Version.parse(load_current_package_version(), optional_minor_and_patch=True)
+        stack_map = utils.load_etc_dump(["stack-schema-map.yaml"])
+        err_msg = f"There is no entry defined for the current package ({package_version}) in the stack-schema-map"
+        self.assertIn(package_version, [Version.parse(v) for v in stack_map], err_msg)
+
+    def test_stack_schemas_above_current_package(self):
+        """Test that a min_stack_version above the current package falls back to the newest stack-schema-map entry."""
+        stack_map = utils.load_etc_dump(["stack-schema-map.yaml"])
+        newest_entry = stack_map[max(stack_map, key=Version.parse)]
+        package_version = Version.parse(load_current_package_version(), optional_minor_and_patch=True)
+        future_version = str(package_version.bump_minor())
+
+        get_stack_schemas.clear()
+        try:
+            schemas = get_stack_schemas(future_version)
+        finally:
+            get_stack_schemas.clear()
+
+        # consumers index by string version and access beats/ecs/endgame directly, so the entry must be complete
+        self.assertEqual(list(schemas), [future_version])
+        self.assertEqual(schemas[future_version], newest_entry)
+        self.assertLessEqual({"beats", "ecs", "endgame"}, set(schemas[future_version]))
+
+        # custom schema lookups must fall back the same way rather than dropping custom schemas
+        newest_version = max(stack_map, key=Version.parse)
+        get_custom_schemas.clear()
+        try:
+            self.assertEqual(get_custom_schemas(future_version), get_custom_schemas(newest_version))
+        finally:
+            get_custom_schemas.clear()
+
+
+class TestNonEcsSchemaFiles(unittest.TestCase):
+    """Test the split between the strictly non-ECS schema and the integration-emitted ECS schema."""
+
+    def test_integration_emitted_schema_holds_only_ecs_fields(self):
+        """Every field in integration-emitted-ecs-schema.json must be an ECS field; others belong in non-ecs-schema.json."""
+        ecs_fields = ecs.flatten_multi_fields(ecs.get_schema(ecs.get_max_version(), name="ecs_flat"))
+        emitted = ecs.get_integration_emitted_ecs_schema()
+        unknown = [
+            f"{index_pattern}: {field}"
+            for index_pattern, fields in emitted.items()
+            for field in ecs.flatten(fields)
+            if field not in ecs_fields
+        ]
+        self.assertEqual(unknown, [], "non-ECS fields found in integration-emitted-ecs-schema.json")
+
+    def test_non_ecs_schema_keeps_ecs_names_only_on_type_conflict(self):
+        """An ECS field stays in non-ecs-schema.json only when its type differs from ECS; otherwise it belongs in
+        integration-emitted-ecs-schema.json."""
+        ecs_fields = ecs.flatten_multi_fields(ecs.get_schema(ecs.get_max_version(), name="ecs_flat"))
+        strict = ecs.get_strict_non_ecs_schema()
+        misplaced = [
+            f"{index_pattern}: {field}"
+            for index_pattern, fields in strict.items()
+            for field, field_type in ecs.flatten(fields).items()
+            if field in ecs_fields and ecs_fields[field] == field_type
+        ]
+        self.assertEqual(misplaced, [], "ECS fields with ECS types belong in integration-emitted-ecs-schema.json")
+
+    def test_schema_files_do_not_overlap(self):
+        """A field must be tracked in exactly one of the two files for a given index pattern."""
+        strict = ecs.get_strict_non_ecs_schema()
+        emitted = ecs.get_integration_emitted_ecs_schema()
+        overlap = [
+            f"{index_pattern}: {field}"
+            for index_pattern in strict.keys() & emitted.keys()
+            for field in ecs.flatten(strict[index_pattern]).keys() & ecs.flatten(emitted[index_pattern]).keys()
+        ]
+        self.assertEqual(overlap, [], "fields present in both non-ecs and integration-emitted-ecs schema files")
+
+    def test_combined_schema_is_union_of_both_files(self):
+        """The combined loader used by validation must expose every entry from both files."""
+        strict = ecs.get_strict_non_ecs_schema()
+        emitted = ecs.get_integration_emitted_ecs_schema()
+        combined = ecs.get_non_ecs_schema()
+        self.assertEqual(set(combined), set(strict) | set(emitted))
+        for index_pattern, fields in combined.items():
+            expected = {**strict.get(index_pattern, {}), **emitted.get(index_pattern, {})}
+            self.assertEqual(fields, expected, index_pattern)
+
+
+class TestESQLValidation(unittest.TestCase):
+    """Test ESQL rule validation"""
+
+    def test_esql_data_validation(self):
+        """Test ESQL rule data validation"""
+
+        # A random ESQL rule to deliver a test query
+        rule_path = Path("tests/data/command_control_dummy_production_rule.toml")
+        rule_body = rule_path.read_text()
+        rule_dict = RuleCollection.deserialize_toml_string(rule_body)
+
+        # Most used order of the metadata fields
+        query = """
+            FROM logs-windows.powershell_operational* METADATA _id, _version, _index
+            | WHERE event.code == "4104"
+            | KEEP event.code, _id, _version, _index
+        """
+        rule_dict["rule"]["query"] = query
+        _ = RuleCollection().load_dict(rule_dict, path=rule_path)
+
+        # The order of the metadata fields from the example in the docs -
+        # https://www.elastic.co/guide/en/security/8.17/rules-ui-create.html#esql-non-agg-query
+        query = """
+            FROM logs-windows.powershell_operational* METADATA _id, _index, _version
+            | WHERE event.code == "4104"
+            | KEEP event.code, _id, _version, _index
+        """
+        rule_dict["rule"]["query"] = query
+        _ = RuleCollection().load_dict(rule_dict, path=rule_path)
+
+        # Different metadata fields
+        with pytest.raises(EsqlSemanticError):
+            query = """
+                FROM logs-windows.powershell_operational* METADATA _foo, _index
+                | WHERE event.code == "4104"
+                | KEEP event.code, _id, _version, _index
+            """
+            rule_dict["rule"]["query"] = query
+            _ = RuleCollection().load_dict(rule_dict, path=rule_path)
+
+        # Missing `keep`
+        with pytest.raises(EsqlSemanticError):
+            query = """
+                FROM logs-windows.powershell_operational* METADATA _id, _index, _version
+                | WHERE event.code == "4104"
+            """
+            rule_dict["rule"]["query"] = query
+            _ = RuleCollection().load_dict(rule_dict, path=rule_path)
+
+    def test_esql_keep_validation_bypass_missing_keep(self):
+        """ES|QL keep checks are skipped when DR_BYPASS_ESQL_KEEP_VALIDATION is set."""
+        # A random ESQL rule to deliver a test query
+        rule_path = Path("tests/data/command_control_dummy_production_rule.toml")
+        rule_body = rule_path.read_text()
+        rule_dict = RuleCollection.deserialize_toml_string(rule_body)
+        query = """
+            FROM logs-windows.powershell_operational* METADATA _id, _index, _version
+            | WHERE event.code == "4104"
+        """
+        rule_dict["rule"]["query"] = query
+        with unittest.mock.patch.dict(os.environ, {"DR_BYPASS_ESQL_KEEP_VALIDATION": "1"}):
+            _ = RuleCollection().load_dict(rule_dict, path=rule_path)
+
+    def test_esql_keep_bypass_does_not_skip_from_metadata_validation(self):
+        """FROM METADATA requirement still applies when only keep validation is bypassed."""
+        # A random ESQL rule to deliver a test query
+        rule_path = Path("tests/data/command_control_dummy_production_rule.toml")
+        rule_body = rule_path.read_text()
+        rule_dict = RuleCollection.deserialize_toml_string(rule_body)
+        query = """
+            FROM logs-windows.powershell_operational*
+            | WHERE event.code == "4104"
+        """
+        rule_dict["rule"]["query"] = query
+        with (
+            unittest.mock.patch.dict(os.environ, {"DR_BYPASS_ESQL_KEEP_VALIDATION": "1"}),
+            pytest.raises(EsqlSemanticError),
+        ):
+            _ = RuleCollection().load_dict(rule_dict, path=rule_path)
+
+    def test_esql_metadata_validation_bypass_missing_from_metadata(self):
+        """ES|QL FROM METADATA checks are skipped when DR_BYPASS_ESQL_METADATA_VALIDATION is set."""
+        # A random ESQL rule to deliver a test query
+        rule_path = Path("tests/data/command_control_dummy_production_rule.toml")
+        rule_body = rule_path.read_text()
+        rule_dict = RuleCollection.deserialize_toml_string(rule_body)
+        query = """
+            FROM logs-windows.powershell_operational*
+            | WHERE event.code == "4104"
+            | KEEP event.code, _id, _version, _index
+        """
+        rule_dict["rule"]["query"] = query
+        with unittest.mock.patch.dict(os.environ, {"DR_BYPASS_ESQL_METADATA_VALIDATION": "1"}):
+            _ = RuleCollection().load_dict(rule_dict, path=rule_path)
+
+    def test_esql_both_bypasses_still_reject_syntax_errors(self):
+        """Both bypass env vars skip KEEP and METADATA checks, not the parser."""
+        rule_path = Path("tests/data/command_control_dummy_production_rule.toml")
+        rule_body = rule_path.read_text()
+        rule_dict = RuleCollection.deserialize_toml_string(rule_body)
+        rule_dict["rule"]["query"] = "FROM logs-windows.powershell_operational* |||"
+        with (
+            unittest.mock.patch.dict(
+                os.environ,
+                {
+                    "DR_BYPASS_ESQL_METADATA_VALIDATION": "1",
+                    "DR_BYPASS_ESQL_KEEP_VALIDATION": "1",
+                },
+            ),
+            pytest.raises(EsqlSyntaxError),
+        ):
+            _ = RuleCollection().load_dict(rule_dict, path=rule_path)
+
+    def test_esql_metadata_bypass_does_not_skip_keep_validation(self):
+        """`keep` validation still applies when only FROM metadata validation is bypassed."""
+        # A random ESQL rule to deliver a test query
+        rule_path = Path("tests/data/command_control_dummy_production_rule.toml")
+        rule_body = rule_path.read_text()
+        rule_dict = RuleCollection.deserialize_toml_string(rule_body)
+        query = """
+            FROM logs-windows.powershell_operational*
+            | WHERE event.code == "4104"
+        """
+        rule_dict["rule"]["query"] = query
+        with (
+            unittest.mock.patch.dict(os.environ, {"DR_BYPASS_ESQL_METADATA_VALIDATION": "1"}),
+            pytest.raises(EsqlSemanticError),
+        ):
+            _ = RuleCollection().load_dict(rule_dict, path=rule_path)
+
+    def test_esql_keep_validation_bypass_missing_metadata_in_keep(self):
+        """ES|QL metadata-in-keep checks are skipped when DR_BYPASS_ESQL_KEEP_VALIDATION is set."""
+        # A random ESQL rule to deliver a test query
+        rule_path = Path("tests/data/command_control_dummy_production_rule.toml")
+        rule_body = rule_path.read_text()
+        rule_dict = RuleCollection.deserialize_toml_string(rule_body)
+        query = """
+            FROM logs-windows.powershell_operational* METADATA _id, _version, _index
+            | WHERE event.code == "4104"
+            | KEEP event.code
+        """
+        rule_dict["rule"]["query"] = query
+        with unittest.mock.patch.dict(os.environ, {"DR_BYPASS_ESQL_KEEP_VALIDATION": "1"}):
+            _ = RuleCollection().load_dict(rule_dict, path=rule_path)
